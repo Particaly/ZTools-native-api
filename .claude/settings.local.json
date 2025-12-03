@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "Bash(npm install)",
+      "Bash(node test/simple.js:*)",
+      "Bash(tree:*)",
+      "Bash(npm run build:*)",
+      "Bash(node test/window-simple.js:*)",
+      "Bash(node test/test-window.js:*)",
+      "Bash(npm run clean:*)",
+      "Bash(node:*)",
+      "Bash(timeout 10 node:*)",
+      "Bash(npm test)",
+      "Bash(dir:*)",
+      "Bash(npm config:*)",
+      "Bash(timeout 5 node:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
