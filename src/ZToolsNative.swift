@@ -164,10 +164,18 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
     isWindowMonitoring = true
 
-    // 获取初始窗口
+    // 获取初始窗口并立即回调一次
     if let appInfo = getFrontmostAppUsingCG() {
         lastProcessId = appInfo.pid
         lastBundleId = appInfo.bundleId
+
+        // 立即回调初始窗口状态
+        let jsonString = """
+        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))"}
+        """
+        jsonString.withCString { cString in
+            callback(cString)
+        }
     }
 
     // 创建专用队列进行轮询

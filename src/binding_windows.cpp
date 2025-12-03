@@ -347,6 +347,15 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
+    // 立即回调当前激活的窗口
+    HWND currentWindow = GetForegroundWindow();
+    if (currentWindow != NULL) {
+        WindowInfo* info = GetWindowInfo(currentWindow);
+        if (info != nullptr) {
+            napi_call_threadsafe_function(g_windowTsfn, info, napi_tsfn_nonblocking);
+        }
+    }
+
     return env.Undefined();
 }
 
