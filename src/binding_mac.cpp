@@ -13,6 +13,7 @@ typedef void (*StartWindowMonitorFunc)(WindowCallback);
 typedef void (*StopWindowMonitorFunc)();
 typedef char* (*GetActiveWindowFunc)();
 typedef int (*ActivateWindowFunc)(const char*);
+typedef int (*SimulatePasteFunc)();  // 模拟粘贴功能
 
 // 全局变量
 static void* swiftLibHandle = nullptr;
@@ -24,6 +25,7 @@ static StartWindowMonitorFunc startWindowMonitorFunc = nullptr;
 static StopWindowMonitorFunc stopWindowMonitorFunc = nullptr;
 static GetActiveWindowFunc getActiveWindowFunc = nullptr;
 static ActivateWindowFunc activateWindowFunc = nullptr;
+static SimulatePasteFunc simulatePasteFunc = nullptr;  // 模拟粘贴函数
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void* context, void* data) {
@@ -159,9 +161,10 @@ bool LoadSwiftLibrary(Napi::Env env) {
     stopWindowMonitorFunc = (StopWindowMonitorFunc)dlsym(swiftLibHandle, "stopWindowMonitor");
     getActiveWindowFunc = (GetActiveWindowFunc)dlsym(swiftLibHandle, "getActiveWindow");
     activateWindowFunc = (ActivateWindowFunc)dlsym(swiftLibHandle, "activateWindow");
+    simulatePasteFunc = (SimulatePasteFunc)dlsym(swiftLibHandle, "simulatePaste");
 
     if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
-        !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc) {
+        !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc || !simulatePasteFunc) {
         Napi::Error::New(env, "Failed to load Swift functions").ThrowAsJavaScriptException();
         dlclose(swiftLibHandle);
         swiftLibHandle = nullptr;
@@ -363,6 +366,17 @@ Napi::Value StopWindowMonitor(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// 模拟粘贴
+Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (!LoadSwiftLibrary(env)) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    int success = simulatePasteFunc();
+    return Napi::Boolean::New(env, success == 1);
+}
 
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -372,6 +386,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopWindowMonitor", Napi::Function::New(env, StopWindowMonitor));
     exports.Set("getActiveWindow", Napi::Function::New(env, GetActiveWindow));
     exports.Set("activateWindow", Napi::Function::New(env, ActivateWindow));
+    exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
     return exports;
 }
 

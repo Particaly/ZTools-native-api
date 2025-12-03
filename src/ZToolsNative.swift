@@ -236,6 +236,53 @@ public func stopWindowMonitor() {
     print("Window monitor stopped")
 }
 
+// MARK: - Keyboard Simulation
+
+/// 模拟粘贴操作（Command + V）
+/// - Returns: 是否成功 (1: 成功, 0: 失败)
+@_cdecl("simulatePaste")
+public func simulatePaste() -> Int32 {
+    // 检查辅助功能权限
+    let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+    let accessEnabled = AXIsProcessTrustedWithOptions(options)
+
+    if !accessEnabled {
+        print("Error: Accessibility permission not granted")
+        return 0
+    }
+
+    // V 键的 keyCode
+    let vKeyCode: CGKeyCode = 9
+
+    // 创建事件源
+    guard let eventSource = CGEventSource(stateID: .hidSystemState) else {
+        print("Error: Failed to create event source")
+        return 0
+    }
+
+    // 1. 按下 Command+V 键
+    guard let cmdDownEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: vKeyCode, keyDown: true) else {
+        return 0
+    }
+    cmdDownEvent.flags = .maskCommand
+
+    // 2. 释放 V 键（带 Command 修饰符）
+    guard let cmdUpEvent = CGEvent(keyboardEventSource: eventSource, virtualKey: vKeyCode, keyDown: false) else {
+        return 0
+    }
+    cmdUpEvent.flags = .maskCommand
+
+    // 发送事件
+    cmdDownEvent.post(tap: .cghidEventTap)
+
+    // 短暂延迟（10毫秒）
+    usleep(10_000)
+
+    cmdUpEvent.post(tap: .cghidEventTap)
+
+    print("Paste simulation executed")
+    return 1
+}
 
 // MARK: - Helper Functions
 

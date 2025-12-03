@@ -152,6 +152,14 @@ class WindowManager {
   static getPlatform() {
     return platform;
   }
+
+  /**
+   * 模拟粘贴操作（Command+V on macOS, Ctrl+V on Windows）
+   * @returns {boolean} 是否成功
+   */
+  static simulatePaste() {
+    return addon.simulatePaste();
+  }
 }
 
 // 导出三个类

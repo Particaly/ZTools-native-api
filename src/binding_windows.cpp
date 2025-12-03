@@ -531,6 +531,42 @@ Napi::Value ActivateWindow(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, newForeground == hwnd);
 }
 
+// ==================== 键盘模拟功能 ====================
+
+// 模拟粘贴操作（Ctrl + V）
+Napi::Value SimulatePaste(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 创建输入事件数组
+    INPUT inputs[4] = {};
+
+    // 1. 按下 Ctrl 键
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_CONTROL;
+    inputs[0].ki.dwFlags = 0;
+
+    // 2. 按下 V 键
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'V';
+    inputs[1].ki.dwFlags = 0;
+
+    // 3. 释放 V 键
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'V';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    // 4. 释放 Ctrl 键
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_CONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    // 发送输入事件
+    UINT result = SendInput(4, inputs, sizeof(INPUT));
+
+    // 返回是否成功（应该发送了4个事件）
+    return Napi::Boolean::New(env, result == 4);
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -539,6 +575,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopWindowMonitor", Napi::Function::New(env, StopWindowMonitor));
     exports.Set("getActiveWindow", Napi::Function::New(env, GetActiveWindowInfo));
     exports.Set("activateWindow", Napi::Function::New(env, ActivateWindow));
+    exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
     return exports;
 }
 
