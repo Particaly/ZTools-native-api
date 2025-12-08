@@ -162,11 +162,38 @@ class WindowManager {
   }
 }
 
-// 导出三个类
+// 区域截图类
+class ScreenCapture {
+  /**
+   * 启动区域截图
+   * @param {Function} callback - 截图完成时的回调函数
+   * - 参数: { success: boolean, width?: number, height?: number }
+   * - success: 是否成功截图
+   * - width: 截图宽度（成功时）
+   * - height: 截图高度（成功时）
+   */
+  static start(callback) {
+    if (platform === 'darwin') {
+      // macOS 暂不支持
+      throw new Error('ScreenCapture is not yet supported on macOS');
+    }
+
+    if (typeof callback !== 'function') {
+      throw new TypeError('Callback must be a function');
+    }
+
+    addon.startRegionCapture((result) => {
+      callback(result);
+    });
+  }
+}
+
+// 导出所有类
 module.exports = {
   ClipboardMonitor,
   WindowMonitor,
-  WindowManager
+  WindowManager,
+  ScreenCapture
 };
 
 // 为了向后兼容，默认导出 ClipboardMonitor
