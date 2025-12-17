@@ -29,7 +29,8 @@
             "libraries": [
               "user32.lib",
               "kernel32.lib",
-              "psapi.lib"
+              "psapi.lib",
+              "shell32.lib"
             ],
             "msvs_settings": {
               "VCCLCompilerTool": {

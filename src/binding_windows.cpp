@@ -1,5 +1,4 @@
 #include <napi.h>
-#define NOMINMAX  // 防止 Windows.h 定义 min/max 宏
 #include <windows.h>
 #include <windowsx.h>  // For GET_X_LPARAM, GET_Y_LPARAM
 #include <psapi.h>
@@ -10,6 +9,17 @@
 #include <algorithm>   // For std::min, std::max
 #include <map>         // For key mapping
 #include <vector>      // For input events
+#include <shellapi.h>  // For DragQueryFile
+
+// 如果 DROPFILES 未定义，手动定义
+#ifndef DROPFILES
+typedef struct _DROPFILES {
+    DWORD pFiles;
+    POINT pt;
+    BOOL fNC;
+    BOOL fWide;
+} DROPFILES, *LPDROPFILES;
+#endif
 
 // 取消与自定义函数名冲突的Windows宏
 #ifdef GetActiveWindow
@@ -940,6 +950,204 @@ Napi::Value StartRegionCapture(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// ==================== 剪贴板文件功能 ====================
+
+// 获取剪贴板中的文件列表
+Napi::Value GetClipboardFiles(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Array result = Napi::Array::New(env);
+
+    // 打开剪贴板
+    if (!OpenClipboard(NULL)) {
+        return result;  // 返回空数组
+    }
+
+    // 检查剪贴板中是否有文件
+    if (!IsClipboardFormatAvailable(CF_HDROP)) {
+        CloseClipboard();
+        return result;  // 返回空数组
+    }
+
+    // 获取文件句柄
+    HDROP hDrop = (HDROP)GetClipboardData(CF_HDROP);
+    if (hDrop == NULL) {
+        CloseClipboard();
+        return result;  // 返回空数组
+    }
+
+    // 获取文件数量
+    UINT fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+
+    // 遍历所有文件
+    for (UINT i = 0; i < fileCount; i++) {
+        // 获取文件路径长度
+        UINT pathLength = DragQueryFileW(hDrop, i, NULL, 0);
+        if (pathLength == 0) {
+            continue;
+        }
+
+        // 获取文件路径
+        std::wstring wPath(pathLength + 1, L'\0');
+        DragQueryFileW(hDrop, i, &wPath[0], pathLength + 1);
+        wPath.resize(pathLength);
+
+        // 转换为 UTF-8
+        int utf8Size = WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), -1, NULL, 0, NULL, NULL);
+        if (utf8Size <= 0) {
+            continue;
+        }
+
+        std::string utf8Path(utf8Size - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), -1, &utf8Path[0], utf8Size, NULL, NULL);
+
+        // 提取文件名
+        size_t lastSlash = utf8Path.find_last_of("\\/");
+        std::string fileName = (lastSlash != std::string::npos)
+            ? utf8Path.substr(lastSlash + 1)
+            : utf8Path;
+
+        // 检查是否是目录
+        DWORD fileAttrs = GetFileAttributesW(wPath.c_str());
+        bool isDirectory = (fileAttrs != INVALID_FILE_ATTRIBUTES) &&
+                          (fileAttrs & FILE_ATTRIBUTE_DIRECTORY);
+
+        // 创建文件信息对象
+        Napi::Object fileInfo = Napi::Object::New(env);
+        fileInfo.Set("path", Napi::String::New(env, utf8Path));
+        fileInfo.Set("name", Napi::String::New(env, fileName));
+        fileInfo.Set("isDirectory", Napi::Boolean::New(env, isDirectory));
+
+        // 添加到结果数组
+        result.Set(i, fileInfo);
+    }
+
+    CloseClipboard();
+    return result;
+}
+
+// 设置剪贴板中的文件列表
+Napi::Value SetClipboardFiles(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    // 参数验证：需要一个数组参数
+    if (info.Length() < 1 || !info[0].IsArray()) {
+        Napi::TypeError::New(env, "Expected an array of file paths or file objects").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    Napi::Array filesArray = info[0].As<Napi::Array>();
+    uint32_t fileCount = filesArray.Length();
+
+    if (fileCount == 0) {
+        Napi::Error::New(env, "File array cannot be empty").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 提取文件路径
+    std::vector<std::wstring> filePaths;
+    for (uint32_t i = 0; i < fileCount; i++) {
+        Napi::Value item = filesArray[i];
+        std::string pathStr;
+
+        // 支持两种格式：
+        // 1. 直接是字符串路径
+        // 2. 对象 { path: "..." }
+        if (item.IsString()) {
+            pathStr = item.As<Napi::String>().Utf8Value();
+        } else if (item.IsObject()) {
+            Napi::Object obj = item.As<Napi::Object>();
+            if (obj.Has("path")) {
+                Napi::Value pathValue = obj.Get("path");
+                if (pathValue.IsString()) {
+                    pathStr = pathValue.As<Napi::String>().Utf8Value();
+                }
+            }
+        }
+
+        if (pathStr.empty()) {
+            continue;
+        }
+
+        // 转换为宽字符
+        int wideSize = MultiByteToWideChar(CP_UTF8, 0, pathStr.c_str(), -1, NULL, 0);
+        if (wideSize > 0) {
+            std::wstring widePath(wideSize - 1, L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, pathStr.c_str(), -1, &widePath[0], wideSize);
+            filePaths.push_back(widePath);
+        }
+    }
+
+    if (filePaths.empty()) {
+        Napi::Error::New(env, "No valid file paths provided").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 计算所需内存大小
+    size_t totalSize = sizeof(DROPFILES);
+    for (const auto& path : filePaths) {
+        totalSize += (path.length() + 1) * sizeof(wchar_t);  // 每个路径加一个 null
+    }
+    totalSize += sizeof(wchar_t);  // 结尾的双 null
+
+    // 分配全局内存
+    HGLOBAL hGlobal = GlobalAlloc(GHND | GMEM_SHARE, totalSize);
+    if (hGlobal == NULL) {
+        Napi::Error::New(env, "Failed to allocate memory").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 锁定内存
+    void* pData = GlobalLock(hGlobal);
+    if (pData == NULL) {
+        GlobalFree(hGlobal);
+        Napi::Error::New(env, "Failed to lock memory").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 填充 DROPFILES 结构
+    DROPFILES* pDropFiles = (DROPFILES*)pData;
+    pDropFiles->pFiles = sizeof(DROPFILES);  // 文件列表偏移量
+    pDropFiles->pt.x = 0;
+    pDropFiles->pt.y = 0;
+    pDropFiles->fNC = FALSE;
+    pDropFiles->fWide = TRUE;  // 使用 Unicode
+
+    // 填充文件路径列表
+    wchar_t* pFilePaths = (wchar_t*)((BYTE*)pData + sizeof(DROPFILES));
+    for (const auto& path : filePaths) {
+        wcscpy(pFilePaths, path.c_str());
+        pFilePaths += path.length() + 1;
+    }
+    *pFilePaths = L'\0';  // 结尾的双 null
+
+    // 解锁内存
+    GlobalUnlock(hGlobal);
+
+    // 打开剪贴板
+    if (!OpenClipboard(NULL)) {
+        GlobalFree(hGlobal);
+        Napi::Error::New(env, "Failed to open clipboard").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 清空剪贴板
+    EmptyClipboard();
+
+    // 设置剪贴板数据
+    HANDLE hResult = SetClipboardData(CF_HDROP, hGlobal);
+
+    // 关闭剪贴板
+    CloseClipboard();
+
+    if (hResult == NULL) {
+        GlobalFree(hGlobal);
+        return Napi::Boolean::New(env, false);
+    }
+
+    // 注意：成功后不要释放 hGlobal，剪贴板会接管内存
+    return Napi::Boolean::New(env, true);
+}
+
 // ==================== 键盘模拟功能 ====================
 
 // 将键名映射为 Windows Virtual Key Code
@@ -1118,6 +1326,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
     exports.Set("simulateKeyboardTap", Napi::Function::New(env, SimulateKeyboardTap));
     exports.Set("startRegionCapture", Napi::Function::New(env, StartRegionCapture));
+    exports.Set("getClipboardFiles", Napi::Function::New(env, GetClipboardFiles));
+    exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
     return exports;
 }
 
