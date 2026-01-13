@@ -9,7 +9,7 @@ console.log(`🔨 Building for ${platform}...\n`);
 try {
   // Step 1: 编译 C++ 原生模块 (跨平台)
   console.log('📦 Running node-gyp rebuild...');
-  execSync('node-gyp rebuild', { stdio: 'inherit' });
+  execSync('npx node-gyp rebuild', { stdio: 'inherit' });
 
   // Step 2: macOS 需要额外编译 Swift
   if (platform === 'darwin') {

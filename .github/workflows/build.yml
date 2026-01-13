@@ -30,7 +30,7 @@ jobs:
         run: npm ci
 
       - name: Build C++ binding (Universal Binary)
-        run: node-gyp rebuild
+        run: npx node-gyp rebuild
 
       - name: Build Swift library (Universal Binary)
         run: |
