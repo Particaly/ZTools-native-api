@@ -71,8 +71,49 @@ public func stopClipboardMonitor() {
 
 // MARK: - Window Management
 
+/// 获取窗口标题（使用 Accessibility API）
+private func getWindowTitle(for pid: pid_t) -> String {
+    let app = AXUIElementCreateApplication(pid)
+    var windowValue: AnyObject?
+    
+    // 获取应用的焦点窗口
+    let result = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowValue)
+    
+    if result == .success, let window = windowValue {
+        var titleValue: AnyObject?
+        let titleResult = AXUIElementCopyAttributeValue(window as! AXUIElement, kAXTitleAttribute as CFString, &titleValue)
+        
+        if titleResult == .success, let title = titleValue as? String {
+            return title
+        }
+    }
+    
+    return ""
+}
+
+/// 获取应用的.app格式名称
+private func getAppName(from app: NSRunningApplication) -> String {
+    // 优先使用应用名称
+    if let localizedName = app.localizedName, !localizedName.isEmpty {
+        return "\(localizedName).app"
+    }
+    
+    // 如果没有本地化名称，尝试从 bundle URL 获取
+    if let bundleURL = app.bundleURL {
+        let appFileName = bundleURL.lastPathComponent
+        // 如果已经包含.app后缀，直接返回
+        if appFileName.hasSuffix(".app") {
+            return appFileName
+        }
+        return "\(appFileName).app"
+    }
+    
+    // 默认返回 Unknown.app
+    return "Unknown.app"
+}
+
 /// 获取当前激活窗口的信息（JSON 格式）
-/// - Returns: JSON 字符串包含 appName 和 bundleId，需要调用者 free
+/// - Returns: JSON 字符串包含 appName、bundleId、windowTitle 和 app，需要调用者 free
 @_cdecl("getActiveWindow")
 public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
     // 获取当前激活的应用
@@ -82,10 +123,12 @@ public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
 
     let appName = frontmostApp.localizedName ?? "Unknown"
     let bundleId = frontmostApp.bundleIdentifier ?? "unknown.bundle.id"
+    let windowTitle = getWindowTitle(for: frontmostApp.processIdentifier)
+    let app = getAppName(from: frontmostApp)
 
     // 构建 JSON 字符串
     let jsonString = """
-    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))"}
+    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))"}
     """
 
     return strdup(jsonString)
@@ -115,7 +158,7 @@ public func activateWindow(_ bundleId: UnsafePointer<CChar>?) -> Int32 {
 // MARK: - Window Monitor
 
 /// 使用 Core Graphics API 获取当前激活的应用（最可靠）
-private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName: String)? {
+private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName: String, windowTitle: String, app: String)? {
     // 获取所有窗口列表，按层级排序
     let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
     guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
@@ -133,12 +176,14 @@ private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName:
         // 跳过窗口层级为 0 的（通常是系统 UI）
         if let layer = window[kCGWindowLayer as String] as? Int, layer == 0 {
             // 获取该窗口所属的应用信息
-            if let app = NSRunningApplication(processIdentifier: pid) {
+            if let runningApp = NSRunningApplication(processIdentifier: pid) {
                 // 只返回有UI的普通应用
-                if app.activationPolicy == .regular {
-                    let bundleId = app.bundleIdentifier ?? "unknown.bundle.id"
-                    let appName = app.localizedName ?? "Unknown"
-                    return (pid: pid, bundleId: bundleId, appName: appName)
+                if runningApp.activationPolicy == .regular {
+                    let bundleId = runningApp.bundleIdentifier ?? "unknown.bundle.id"
+                    let appName = runningApp.localizedName ?? "Unknown"
+                    let windowTitle = getWindowTitle(for: pid)
+                    let app = getAppName(from: runningApp)
+                    return (pid: pid, bundleId: bundleId, appName: appName, windowTitle: windowTitle, app: app)
                 }
             }
         }
@@ -171,7 +216,7 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
         // 立即回调初始窗口状态
         let jsonString = """
-        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))"}
+        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))","windowTitle":"\(escapeJSON(appInfo.windowTitle))","app":"\(escapeJSON(appInfo.app))"}
         """
         jsonString.withCString { cString in
             callback(cString)
@@ -195,6 +240,8 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
             let currentPid = appInfo.pid
             let currentBundleId = appInfo.bundleId
             let appName = appInfo.appName
+            let windowTitle = appInfo.windowTitle
+            let app = appInfo.app
 
             // 检测到窗口切换（使用 PID 比较更可靠）
             if currentPid != lastProcessId {
@@ -203,7 +250,7 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
 
                 // 构建JSON字符串
                 let jsonString = """
-                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))"}
+                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))","windowTitle":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))"}
                 """
 
                 // 调用回调

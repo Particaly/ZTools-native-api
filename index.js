@@ -112,7 +112,7 @@ class WindowMonitor {
   /**
    * 启动窗口监控
    * @param {Function} callback - 窗口切换时的回调函数
-   * - macOS: { appName: string, bundleId: string }
+   * - macOS: { appName: string, bundleId: string, windowTitle: string, app: string }
    * - Windows: { appName: string, processId: number }
    */
   start(callback) {
@@ -160,8 +160,8 @@ class WindowMonitor {
 class WindowManager {
   /**
    * 获取当前激活的窗口信息
-   * @returns {{appName: string, bundleId?: string, processId?: number}|null} 窗口信息对象
-   * - macOS: { appName, bundleId }
+   * @returns {{appName: string, bundleId?: string, windowTitle?: string, app?: string, processId?: number}|null} 窗口信息对象
+   * - macOS: { appName, bundleId, windowTitle, app }
    * - Windows: { appName, processId }
    */
   static getActiveWindow() {
