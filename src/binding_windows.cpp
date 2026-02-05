@@ -192,6 +192,11 @@ struct WindowInfo {
     std::string appName;
     std::string windowTitle;
     std::string app;
+    std::string appPath;
+    int x;
+    int y;
+    int width;
+    int height;
 };
 
 // 获取窗口信息的辅助函数
@@ -204,6 +209,20 @@ WindowInfo* GetWindowInfo(HWND hwnd) {
 
     // 获取进程 ID
     GetWindowThreadProcessId(hwnd, &info->processId);
+
+    // 获取窗口位置和大小
+    RECT rect;
+    if (GetWindowRect(hwnd, &rect)) {
+        info->x = rect.left;
+        info->y = rect.top;
+        info->width = rect.right - rect.left;
+        info->height = rect.bottom - rect.top;
+    } else {
+        info->x = 0;
+        info->y = 0;
+        info->width = 0;
+        info->height = 0;
+    }
 
     // 获取窗口标题
     int titleLength = GetWindowTextLengthW(hwnd);
@@ -226,8 +245,15 @@ WindowInfo* GetWindowInfo(HWND hwnd) {
         // 获取可执行文件路径
         WCHAR path[MAX_PATH] = {0};
         if (GetModuleFileNameExW(hProcess, NULL, path, MAX_PATH)) {
-            // 提取文件名（去掉路径）
+            // 保存完整路径到 appPath 字段
             std::wstring fullPath(path);
+            int pathSize = WideCharToMultiByte(CP_UTF8, 0, fullPath.c_str(), -1, NULL, 0, NULL, NULL);
+            if (pathSize > 0) {
+                info->appPath.resize(pathSize - 1);
+                WideCharToMultiByte(CP_UTF8, 0, fullPath.c_str(), -1, &info->appPath[0], pathSize, NULL, NULL);
+            }
+
+            // 提取文件名（去掉路径）
             size_t lastSlash = fullPath.find_last_of(L"\\");
             std::wstring fileNameWithExt = (lastSlash != std::wstring::npos)
                 ? fullPath.substr(lastSlash + 1)
@@ -273,6 +299,10 @@ void CallWindowJs(napi_env env, napi_value js_callback, void* context, void* dat
         napi_create_uint32(env, info->processId, &processId);
         napi_set_named_property(env, result, "processId", processId);
 
+        napi_value pid;
+        napi_create_uint32(env, info->processId, &pid);
+        napi_set_named_property(env, result, "pid", pid);
+
         napi_value appName;
         napi_create_string_utf8(env, info->appName.c_str(), NAPI_AUTO_LENGTH, &appName);
         napi_set_named_property(env, result, "appName", appName);
@@ -284,6 +314,26 @@ void CallWindowJs(napi_env env, napi_value js_callback, void* context, void* dat
         napi_value app;
         napi_create_string_utf8(env, info->app.c_str(), NAPI_AUTO_LENGTH, &app);
         napi_set_named_property(env, result, "app", app);
+
+        napi_value appPath;
+        napi_create_string_utf8(env, info->appPath.c_str(), NAPI_AUTO_LENGTH, &appPath);
+        napi_set_named_property(env, result, "appPath", appPath);
+
+        napi_value x;
+        napi_create_int32(env, info->x, &x);
+        napi_set_named_property(env, result, "x", x);
+
+        napi_value y;
+        napi_create_int32(env, info->y, &y);
+        napi_set_named_property(env, result, "y", y);
+
+        napi_value width;
+        napi_create_int32(env, info->width, &width);
+        napi_set_named_property(env, result, "width", width);
+
+        napi_value height;
+        napi_create_int32(env, info->height, &height);
+        napi_set_named_property(env, result, "height", height);
 
         // 调用回调
         napi_value global;
@@ -460,6 +510,21 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
     DWORD processId = 0;
     GetWindowThreadProcessId(hwnd, &processId);
     result.Set("processId", Napi::Number::New(env, processId));
+    result.Set("pid", Napi::Number::New(env, processId));
+
+    // 获取窗口位置和大小
+    RECT rect;
+    if (GetWindowRect(hwnd, &rect)) {
+        result.Set("x", Napi::Number::New(env, rect.left));
+        result.Set("y", Napi::Number::New(env, rect.top));
+        result.Set("width", Napi::Number::New(env, rect.right - rect.left));
+        result.Set("height", Napi::Number::New(env, rect.bottom - rect.top));
+    } else {
+        result.Set("x", Napi::Number::New(env, 0));
+        result.Set("y", Napi::Number::New(env, 0));
+        result.Set("width", Napi::Number::New(env, 0));
+        result.Set("height", Napi::Number::New(env, 0));
+    }
 
     // 获取窗口标题
     int titleLength = GetWindowTextLengthW(hwnd);
@@ -483,8 +548,16 @@ Napi::Value GetActiveWindowInfo(const Napi::CallbackInfo& info) {
         // 获取可执行文件路径
         WCHAR path[MAX_PATH] = {0};
         if (GetModuleFileNameExW(hProcess, NULL, path, MAX_PATH)) {
-            // 提取文件名（去掉路径）
+            // 保存完整路径到 appPath 字段
             std::wstring fullPath(path);
+            int pathSize = WideCharToMultiByte(CP_UTF8, 0, fullPath.c_str(), -1, NULL, 0, NULL, NULL);
+            if (pathSize > 0) {
+                std::string pathUtf8(pathSize - 1, 0);
+                WideCharToMultiByte(CP_UTF8, 0, fullPath.c_str(), -1, &pathUtf8[0], pathSize, NULL, NULL);
+                result.Set("appPath", Napi::String::New(env, pathUtf8));
+            }
+
+            // 提取文件名（去掉路径）
             size_t lastSlash = fullPath.find_last_of(L"\\");
             std::wstring fileNameWithExt = (lastSlash != std::wstring::npos)
                 ? fullPath.substr(lastSlash + 1)
