@@ -16,6 +16,9 @@ typedef int (*ActivateWindowFunc)(const char *);
 typedef int (*SimulatePasteFunc)(); // 模拟粘贴功能
 typedef int (*SimulateKeyboardTapFunc)(const char *,
                                        const char *); // 模拟键盘按键功能
+typedef void (*MouseEventCB)(const char *);                       // 鼠标事件回调
+typedef void (*StartMouseMonitorFunc)(const char *, int, MouseEventCB); // 启动鼠标监控
+typedef void (*StopMouseMonitorFunc)();                            // 停止鼠标监控
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -30,6 +33,9 @@ static ActivateWindowFunc activateWindowFunc = nullptr;
 static SimulatePasteFunc simulatePasteFunc = nullptr; // 模拟粘贴函数
 static SimulateKeyboardTapFunc simulateKeyboardTapFunc =
     nullptr; // 模拟键盘按键函数
+static napi_threadsafe_function mouseTsfn = nullptr;
+static StartMouseMonitorFunc startMouseMonitorFunc = nullptr;
+static StopMouseMonitorFunc stopMouseMonitorFunc = nullptr;
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -241,10 +247,15 @@ bool LoadSwiftLibrary(Napi::Env env) {
   simulatePasteFunc = (SimulatePasteFunc)dlsym(swiftLibHandle, "simulatePaste");
   simulateKeyboardTapFunc =
       (SimulateKeyboardTapFunc)dlsym(swiftLibHandle, "simulateKeyboardTap");
+  startMouseMonitorFunc =
+      (StartMouseMonitorFunc)dlsym(swiftLibHandle, "startMouseMonitor");
+  stopMouseMonitorFunc =
+      (StopMouseMonitorFunc)dlsym(swiftLibHandle, "stopMouseMonitor");
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
-      !simulatePasteFunc || !simulateKeyboardTapFunc) {
+      !simulatePasteFunc || !simulateKeyboardTapFunc ||
+      !startMouseMonitorFunc || !stopMouseMonitorFunc) {
     Napi::Error::New(env, "Failed to load Swift functions")
         .ThrowAsJavaScriptException();
     dlclose(swiftLibHandle);
@@ -530,6 +541,102 @@ Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo &info) {
   return Napi::Boolean::New(env, success == 1);
 }
 
+// 在主线程调用 JS 回调（鼠标事件）
+void CallMouseJs(napi_env env, napi_value js_callback, void *context,
+                 void *data) {
+  if (env != nullptr && js_callback != nullptr && data != nullptr) {
+    char *eventType = static_cast<char *>(data);
+    Napi::Env napiEnv(env);
+    Napi::Object result = Napi::Object::New(napiEnv);
+    result.Set("type", Napi::String::New(napiEnv, eventType));
+    free(eventType);
+
+    napi_value global;
+    napi_get_global(env, &global);
+    napi_value resultValue = result;
+    napi_call_function(env, global, js_callback, 1, &resultValue, nullptr);
+  }
+}
+
+// Swift 鼠标回调 -> 推送到线程安全队列
+void OnMouseEvent(const char *eventType) {
+  if (mouseTsfn != nullptr && eventType != nullptr) {
+    char *copy = strdup(eventType);
+    napi_call_threadsafe_function(mouseTsfn, copy, napi_tsfn_nonblocking);
+  }
+}
+
+// 启动鼠标监控
+Napi::Value StartMouseMonitor(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return env.Undefined();
+  }
+
+  // 参数1：buttonType（字符串）
+  if (info.Length() < 1 || !info[0].IsString()) {
+    Napi::TypeError::New(
+        env, "Expected buttonType as first argument (string)")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // 参数2：longPressMs（数字）
+  if (info.Length() < 2 || !info[1].IsNumber()) {
+    Napi::TypeError::New(env,
+                         "Expected longPressMs as second argument (number)")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // 参数3：callback（函数）
+  if (info.Length() < 3 || !info[2].IsFunction()) {
+    Napi::TypeError::New(env,
+                         "Expected callback function as third argument")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (mouseTsfn != nullptr) {
+    Napi::Error::New(env, "Mouse monitor already started")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string buttonType = info[0].As<Napi::String>().Utf8Value();
+  int longPressMs = info[1].As<Napi::Number>().Int32Value();
+
+  napi_value callback = info[2];
+  napi_value resource_name;
+  napi_create_string_utf8(env, "MouseCallback", NAPI_AUTO_LENGTH,
+                          &resource_name);
+
+  napi_create_threadsafe_function(env, callback, nullptr, resource_name, 0, 1,
+                                  nullptr, nullptr, nullptr, CallMouseJs,
+                                  &mouseTsfn);
+
+  startMouseMonitorFunc(buttonType.c_str(), longPressMs, OnMouseEvent);
+
+  return env.Undefined();
+}
+
+// 停止鼠标监控
+Napi::Value StopMouseMonitor(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (stopMouseMonitorFunc != nullptr) {
+    stopMouseMonitorFunc();
+  }
+
+  if (mouseTsfn != nullptr) {
+    napi_release_threadsafe_function(mouseTsfn, napi_tsfn_release);
+    mouseTsfn = nullptr;
+  }
+
+  return env.Undefined();
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -542,6 +649,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("simulatePaste", Napi::Function::New(env, SimulatePaste));
   exports.Set("simulateKeyboardTap",
               Napi::Function::New(env, SimulateKeyboardTap));
+  exports.Set("startMouseMonitor",
+              Napi::Function::New(env, StartMouseMonitor));
+  exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
   return exports;
 }
 

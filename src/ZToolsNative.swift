@@ -494,6 +494,292 @@ public func simulateKeyboardTap(_ key: UnsafePointer<CChar>?, _ modifiers: Unsaf
     return 1
 }
 
+// MARK: - Mouse Monitor
+
+public typealias MouseCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
+
+private var mouseMonitorCallback: MouseCallback? = nil
+private var mouseEventTap: CFMachPort? = nil
+private var mouseRunLoopSource: CFRunLoopSource? = nil
+private var mouseMonitorRunLoop: CFRunLoop? = nil
+private var isMouseMonitoring = false
+
+// 当前监听配置
+private var mouseButtonType: String = ""   // "middle", "right", "back", "forward"
+private var mouseLongPressMs: Int = 0      // 0=点击, >0=长按阈值
+private var mouseIsLongPress: Bool = false // 是否为长按模式
+private var mouseEventTypeName: String = "" // 回调事件名（如 "middleClick", "backLongPress"）
+
+// 按钮目标编号（CGEvent buttonNumber: 1=right, 2=middle, 3=back, 4=forward）
+private var mouseTargetButton: Int64 = -1
+private var mouseTargetIsRight: Bool = false // 是否监听右键（右键事件类型不同）
+
+// 按钮状态（通过 mouseLock 保护跨线程访问）
+private var mouseLock = NSLock()
+private var btnIsDown = false
+private var btnLongPressFired = false
+private var btnTimer: DispatchWorkItem? = nil
+private var storedMouseDownEvent: CGEvent? = nil // 存储原始 mouseDown 用于重放
+
+private let mouseTimerQueue = DispatchQueue(label: "com.ztools.mouse.timer", qos: .userInteractive)
+
+// 重放标记：用于识别我们重新注入的事件，避免二次拦截
+private let MOUSE_REPLAY_MARKER: Int64 = 0x5A544F4F4C53
+
+private func notifyMouseEvent() {
+    guard let callback = mouseMonitorCallback else { return }
+    mouseEventTypeName.withCString { cStr in
+        callback(cStr)
+    }
+}
+
+/// CGEventTap 回调函数（拦截模式）
+func mouseEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent, _ userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    guard isMouseMonitoring else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // 处理系统禁用事件（tap 超时被系统关闭时重新启用）
+    if type.rawValue == 0xFFFFFFFE || type.rawValue == 0xFFFFFFFF {
+        if let tap = mouseEventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    // 跳过重放事件（我们自己注入的带标记的事件，直接放行）
+    if event.getIntegerValueField(.eventSourceUserData) == MOUSE_REPLAY_MARKER {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // 判断是否是目标按钮事件
+    var isTargetDown = false
+    var isTargetUp = false
+
+    if mouseTargetIsRight {
+        isTargetDown = (type == .rightMouseDown)
+        isTargetUp = (type == .rightMouseUp)
+    } else {
+        if type == .otherMouseDown {
+            isTargetDown = (event.getIntegerValueField(.mouseEventButtonNumber) == mouseTargetButton)
+        } else if type == .otherMouseUp {
+            isTargetUp = (event.getIntegerValueField(.mouseEventButtonNumber) == mouseTargetButton)
+        }
+    }
+
+    // 非目标事件，放行
+    if !isTargetDown && !isTargetUp {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // ── 目标按钮按下 ──
+    if isTargetDown {
+        mouseLock.lock()
+        btnIsDown = true
+        btnLongPressFired = false
+        storedMouseDownEvent = event.copy()
+        btnTimer?.cancel()
+
+        if mouseIsLongPress {
+            let timer = DispatchWorkItem {
+                mouseLock.lock()
+                guard btnIsDown else {
+                    mouseLock.unlock()
+                    return
+                }
+                btnLongPressFired = true
+                mouseLock.unlock()
+                notifyMouseEvent()
+            }
+            btnTimer = timer
+            mouseTimerQueue.asyncAfter(deadline: .now() + .milliseconds(mouseLongPressMs), execute: timer)
+        }
+        mouseLock.unlock()
+        return nil // 拦截 mouseDown，阻止默认行为
+    }
+
+    // ── 目标按钮释放 ──
+    if isTargetUp {
+        mouseLock.lock()
+        let wasDown = btnIsDown
+        let longPressFired = btnLongPressFired
+        let storedDown = storedMouseDownEvent
+        btnTimer?.cancel()
+        btnTimer = nil
+        btnIsDown = false
+        btnLongPressFired = false
+        storedMouseDownEvent = nil
+        mouseLock.unlock()
+
+        if !wasDown {
+            return Unmanaged.passUnretained(event) // 非配对事件，放行
+        }
+
+        if mouseIsLongPress {
+            if longPressFired {
+                // 长按已触发回调，吞掉 mouseUp
+                return nil
+            } else {
+                // 未达到长按阈值，重放原始 mouseDown + mouseUp（恢复默认行为）
+                if let downEvent = storedDown {
+                    downEvent.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+                    downEvent.post(tap: .cgSessionEventTap)
+                }
+                if let upEvent = event.copy() {
+                    upEvent.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+                    upEvent.post(tap: .cgSessionEventTap)
+                }
+                return nil // 拦截当前 mouseUp，重放的带标记事件会被放行
+            }
+        } else {
+            // 点击模式：触发回调，拦截事件
+            notifyMouseEvent()
+            return nil
+        }
+    }
+
+    return Unmanaged.passUnretained(event)
+}
+
+/// 启动鼠标监控
+/// - Parameters:
+///   - buttonType: 按钮类型（"middle", "right", "back", "forward"）
+///   - longPressMs: 长按阈值（毫秒），0 表示监听点击，>0 表示监听长按
+///   - callback: 事件回调，传递事件类型字符串
+@_cdecl("startMouseMonitor")
+public func startMouseMonitor(_ buttonType: UnsafePointer<CChar>?, _ longPressMs: Int32, _ callback: MouseCallback?) {
+    guard let callback = callback, let buttonType = buttonType else {
+        print("Error: mouse callback or buttonType is nil")
+        return
+    }
+
+    guard !isMouseMonitoring else {
+        print("Warning: Mouse monitor already running")
+        return
+    }
+
+    let button = String(cString: buttonType)
+    mouseButtonType = button
+    mouseLongPressMs = Int(longPressMs)
+    mouseIsLongPress = longPressMs > 0
+    mouseMonitorCallback = callback
+    isMouseMonitoring = true
+
+    // 确定目标按钮和事件名
+    switch button {
+    case "middle":
+        mouseTargetButton = 2
+        mouseTargetIsRight = false
+        mouseEventTypeName = mouseIsLongPress ? "middleLongPress" : "middleClick"
+    case "right":
+        mouseTargetButton = 1
+        mouseTargetIsRight = true
+        mouseEventTypeName = "rightLongPress"
+    case "back":
+        mouseTargetButton = 3
+        mouseTargetIsRight = false
+        mouseEventTypeName = mouseIsLongPress ? "backLongPress" : "backClick"
+    case "forward":
+        mouseTargetButton = 4
+        mouseTargetIsRight = false
+        mouseEventTypeName = mouseIsLongPress ? "forwardLongPress" : "forwardClick"
+    default:
+        print("Error: Unknown button type '\(button)'")
+        isMouseMonitoring = false
+        return
+    }
+
+    DispatchQueue.global(qos: .userInteractive).async {
+        // 只监听目标按钮对应的事件类型
+        var eventMask: CGEventMask = 0
+        if mouseTargetIsRight {
+            eventMask = (1 << CGEventType.rightMouseDown.rawValue) |
+                        (1 << CGEventType.rightMouseUp.rawValue)
+        } else {
+            eventMask = (1 << CGEventType.otherMouseDown.rawValue) |
+                        (1 << CGEventType.otherMouseUp.rawValue)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: mouseEventTapHandler,
+            userInfo: nil
+        ) else {
+            print("Error: Failed to create mouse event tap. Check accessibility permissions.")
+            isMouseMonitoring = false
+            return
+        }
+
+        mouseEventTap = tap
+
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            print("Error: Failed to create run loop source")
+            CFMachPortInvalidate(tap)
+            mouseEventTap = nil
+            isMouseMonitoring = false
+            return
+        }
+
+        mouseRunLoopSource = source
+        mouseMonitorRunLoop = CFRunLoopGetCurrent()
+        CFRunLoopAddSource(mouseMonitorRunLoop!, source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        print("Mouse monitor started: \(mouseEventTypeName)")
+        CFRunLoopRun()
+        print("Mouse monitor run loop ended")
+    }
+}
+
+/// 停止鼠标监控
+@_cdecl("stopMouseMonitor")
+public func stopMouseMonitor() {
+    guard isMouseMonitoring else { return }
+
+    isMouseMonitoring = false
+
+    // 清理状态
+    mouseLock.lock()
+    btnTimer?.cancel()
+    btnTimer = nil
+    // 如果有未完成的按下事件，重放它以恢复默认行为
+    if btnIsDown, let storedDown = storedMouseDownEvent {
+        storedDown.setIntegerValueField(.eventSourceUserData, value: MOUSE_REPLAY_MARKER)
+        storedDown.post(tap: .cgSessionEventTap)
+    }
+    btnIsDown = false
+    btnLongPressFired = false
+    storedMouseDownEvent = nil
+    mouseLock.unlock()
+
+    // 停止事件监听
+    if let tap = mouseEventTap {
+        CGEvent.tapEnable(tap: tap, enable: false)
+    }
+
+    if let source = mouseRunLoopSource, let runLoop = mouseMonitorRunLoop {
+        CFRunLoopRemoveSource(runLoop, source, .commonModes)
+    }
+
+    if let runLoop = mouseMonitorRunLoop {
+        CFRunLoopStop(runLoop)
+    }
+
+    if let tap = mouseEventTap {
+        CFMachPortInvalidate(tap)
+    }
+
+    mouseRunLoopSource = nil
+    mouseEventTap = nil
+    mouseMonitorRunLoop = nil
+    mouseMonitorCallback = nil
+
+    print("Mouse monitor stopped")
+}
+
 // MARK: - Helper Functions
 
 /// 辅助函数：转义 JSON 字符串

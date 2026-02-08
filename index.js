@@ -258,6 +258,72 @@ class WindowManager {
   }
 }
 
+class MouseMonitor {
+  static _callback = null;
+  static _isMonitoring = false;
+
+  /**
+   * 启动鼠标监控
+   * @param {string} buttonType - 按钮类型：'middle' | 'right' | 'back' | 'forward'
+   * @param {number} longPressMs - 长按阈值（毫秒）
+   *   - 0: 监听点击（mouseUp 时触发）
+   *   - >0: 监听长按（按住达到该时长后触发）
+   *   - 注意：'right' 只支持长按（longPressMs 必须 > 0）
+   * @param {Function} callback - 鼠标事件回调函数（无参数）
+   */
+  static start(buttonType, longPressMs, callback) {
+    if (MouseMonitor._isMonitoring) {
+      throw new Error('Mouse monitor is already running');
+    }
+
+    const validButtons = ['middle', 'right', 'back', 'forward'];
+    if (!validButtons.includes(buttonType)) {
+      throw new TypeError(`buttonType must be one of: ${validButtons.join(', ')}`);
+    }
+
+    if (typeof longPressMs !== 'number' || longPressMs < 0) {
+      throw new TypeError('longPressMs must be a non-negative number');
+    }
+
+    if (buttonType === 'right' && longPressMs === 0) {
+      throw new TypeError("'right' button only supports long press (longPressMs must be > 0)");
+    }
+
+    if (typeof callback !== 'function') {
+      throw new TypeError('Callback must be a function');
+    }
+
+    MouseMonitor._callback = callback;
+    MouseMonitor._isMonitoring = true;
+
+    addon.startMouseMonitor(buttonType, longPressMs, () => {
+      if (MouseMonitor._callback) {
+        MouseMonitor._callback();
+      }
+    });
+  }
+
+  /**
+   * 停止鼠标监控
+   */
+  static stop() {
+    if (!MouseMonitor._isMonitoring) {
+      return;
+    }
+
+    addon.stopMouseMonitor();
+    MouseMonitor._isMonitoring = false;
+    MouseMonitor._callback = null;
+  }
+
+  /**
+   * 是否正在监控
+   */
+  static get isMonitoring() {
+    return MouseMonitor._isMonitoring;
+  }
+}
+
 // 区域截图类
 class ScreenCapture {
   /**
@@ -289,7 +355,8 @@ module.exports = {
   ClipboardMonitor,
   WindowMonitor,
   WindowManager,
-  ScreenCapture
+  ScreenCapture,
+  MouseMonitor
 };
 
 // 为了向后兼容，默认导出 ClipboardMonitor
