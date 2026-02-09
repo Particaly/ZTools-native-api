@@ -60,6 +60,8 @@ static int g_mouseLongPressMs = 0;
 static std::atomic<bool> g_mouseButtonPressed(false);
 static std::chrono::steady_clock::time_point g_mousePressStartTime;
 static std::atomic<bool> g_mouseLongPressTriggered(false);
+static bool g_mouseNeedReplay = false;
+#define MOUSE_REPLAY_MAGIC 0x5A544F4F
 
 // 窗口过程（处理剪贴板消息）
 LRESULT CALLBACK ClipboardWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1407,6 +1409,12 @@ void CallMouseJs(napi_env env, napi_value js_callback, void* context, void* data
 LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && g_isMouseMonitoring) {
         MSLLHOOKSTRUCT* pMouseStruct = (MSLLHOOKSTRUCT*)lParam;
+
+        // 跳过自己通过 SendInput 重放的事件（通过 dwExtraInfo 标记识别）
+        if (pMouseStruct->dwExtraInfo == MOUSE_REPLAY_MAGIC) {
+            return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+        }
+
         bool shouldBlock = false;
 
         // 根据按钮类型处理不同的鼠标事件
@@ -1415,21 +1423,20 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_mouseButtonPressed = true;
                 g_mousePressStartTime = std::chrono::steady_clock::now();
                 g_mouseLongPressTriggered = false;
-                // 始终屏蔽按下事件
                 shouldBlock = true;
             } else if (wParam == WM_MBUTTONUP) {
                 if (g_mouseButtonPressed) {
                     g_mouseButtonPressed = false;
-                    // 点击模式：始终屏蔽并触发回调
                     if (g_mouseLongPressMs == 0) {
                         shouldBlock = true;
                         if (!g_mouseLongPressTriggered && g_mouseTsfn != nullptr) {
                             napi_call_threadsafe_function(g_mouseTsfn, nullptr, napi_tsfn_nonblocking);
                         }
-                    }
-                    // 长按模式：只有触发了长按才屏蔽
-                    else {
-                        shouldBlock = g_mouseLongPressTriggered;
+                    } else {
+                        shouldBlock = true;
+                        if (!g_mouseLongPressTriggered) {
+                            g_mouseNeedReplay = true;
+                        }
                     }
                 }
             }
@@ -1438,23 +1445,23 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_mouseButtonPressed = true;
                 g_mousePressStartTime = std::chrono::steady_clock::now();
                 g_mouseLongPressTriggered = false;
-                // 始终屏蔽按下事件
                 shouldBlock = true;
             } else if (wParam == WM_RBUTTONUP) {
                 if (g_mouseButtonPressed) {
                     g_mouseButtonPressed = false;
-                    // 右键只支持长按模式，只有触发了长按才屏蔽
-                    shouldBlock = g_mouseLongPressTriggered;
+                    shouldBlock = true;
+                    if (!g_mouseLongPressTriggered) {
+                        g_mouseNeedReplay = true;
+                    }
                 }
             }
         } else if (g_mouseButtonType == "back") {
             if (wParam == WM_XBUTTONDOWN) {
                 WORD xButton = GET_XBUTTON_WPARAM(pMouseStruct->mouseData);
-                if (xButton == XBUTTON1) {  // Back button
+                if (xButton == XBUTTON1) {
                     g_mouseButtonPressed = true;
                     g_mousePressStartTime = std::chrono::steady_clock::now();
                     g_mouseLongPressTriggered = false;
-                    // 始终屏蔽按下事件
                     shouldBlock = true;
                 }
             } else if (wParam == WM_XBUTTONUP) {
@@ -1462,16 +1469,16 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (xButton == XBUTTON1) {
                     if (g_mouseButtonPressed) {
                         g_mouseButtonPressed = false;
-                        // 点击模式：始终屏蔽并触发回调
                         if (g_mouseLongPressMs == 0) {
                             shouldBlock = true;
                             if (!g_mouseLongPressTriggered && g_mouseTsfn != nullptr) {
                                 napi_call_threadsafe_function(g_mouseTsfn, nullptr, napi_tsfn_nonblocking);
                             }
-                        }
-                        // 长按模式：只有触发了长按才屏蔽
-                        else {
-                            shouldBlock = g_mouseLongPressTriggered;
+                        } else {
+                            shouldBlock = true;
+                            if (!g_mouseLongPressTriggered) {
+                                g_mouseNeedReplay = true;
+                            }
                         }
                     }
                 }
@@ -1479,11 +1486,10 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         } else if (g_mouseButtonType == "forward") {
             if (wParam == WM_XBUTTONDOWN) {
                 WORD xButton = GET_XBUTTON_WPARAM(pMouseStruct->mouseData);
-                if (xButton == XBUTTON2) {  // Forward button
+                if (xButton == XBUTTON2) {
                     g_mouseButtonPressed = true;
                     g_mousePressStartTime = std::chrono::steady_clock::now();
                     g_mouseLongPressTriggered = false;
-                    // 始终屏蔽按下事件
                     shouldBlock = true;
                 }
             } else if (wParam == WM_XBUTTONUP) {
@@ -1491,16 +1497,16 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (xButton == XBUTTON2) {
                     if (g_mouseButtonPressed) {
                         g_mouseButtonPressed = false;
-                        // 点击模式：始终屏蔽并触发回调
                         if (g_mouseLongPressMs == 0) {
                             shouldBlock = true;
                             if (!g_mouseLongPressTriggered && g_mouseTsfn != nullptr) {
                                 napi_call_threadsafe_function(g_mouseTsfn, nullptr, napi_tsfn_nonblocking);
                             }
-                        }
-                        // 长按模式：只有触发了长按才屏蔽
-                        else {
-                            shouldBlock = g_mouseLongPressTriggered;
+                        } else {
+                            shouldBlock = true;
+                            if (!g_mouseLongPressTriggered) {
+                                g_mouseNeedReplay = true;
+                            }
                         }
                     }
                 }
@@ -1529,14 +1535,58 @@ void MouseMonitorThread() {
     // 消息循环
     MSG msg;
     while (g_isMouseMonitoring) {
-        // 处理消息
+        // 等待消息到达或超时（用于长按检测），有消息时立即返回，无延迟
+        MsgWaitForMultipleObjects(0, NULL, FALSE, 10, QS_ALLINPUT);
+
+        // 处理所有待处理消息
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 g_isMouseMonitoring = false;
                 break;
             }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+        }
+
+        // 长按未触发时，从消息循环中重放原始点击（不在钩子回调中调用 SendInput）
+        if (g_mouseNeedReplay) {
+            g_mouseNeedReplay = false;
+            INPUT inputs[2] = {};
+            if (g_mouseButtonType == "middle") {
+                inputs[0].type = INPUT_MOUSE;
+                inputs[0].mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
+                inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                inputs[1].type = INPUT_MOUSE;
+                inputs[1].mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+                inputs[1].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                SendInput(2, inputs, sizeof(INPUT));
+            } else if (g_mouseButtonType == "right") {
+                inputs[0].type = INPUT_MOUSE;
+                inputs[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+                inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                inputs[1].type = INPUT_MOUSE;
+                inputs[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+                inputs[1].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                SendInput(2, inputs, sizeof(INPUT));
+            } else if (g_mouseButtonType == "back") {
+                inputs[0].type = INPUT_MOUSE;
+                inputs[0].mi.dwFlags = MOUSEEVENTF_XDOWN;
+                inputs[0].mi.mouseData = XBUTTON1;
+                inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                inputs[1].type = INPUT_MOUSE;
+                inputs[1].mi.dwFlags = MOUSEEVENTF_XUP;
+                inputs[1].mi.mouseData = XBUTTON1;
+                inputs[1].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                SendInput(2, inputs, sizeof(INPUT));
+            } else if (g_mouseButtonType == "forward") {
+                inputs[0].type = INPUT_MOUSE;
+                inputs[0].mi.dwFlags = MOUSEEVENTF_XDOWN;
+                inputs[0].mi.mouseData = XBUTTON2;
+                inputs[0].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                inputs[1].type = INPUT_MOUSE;
+                inputs[1].mi.dwFlags = MOUSEEVENTF_XUP;
+                inputs[1].mi.mouseData = XBUTTON2;
+                inputs[1].mi.dwExtraInfo = MOUSE_REPLAY_MAGIC;
+                SendInput(2, inputs, sizeof(INPUT));
+            }
         }
 
         // 检查长按
@@ -1551,9 +1601,6 @@ void MouseMonitorThread() {
                 }
             }
         }
-
-        // 短暂休眠避免CPU占用过高
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // 清理钩子
@@ -1671,6 +1718,7 @@ Napi::Value StopMouseMonitor(const Napi::CallbackInfo& info) {
     // 重置状态
     g_mouseButtonPressed = false;
     g_mouseLongPressTriggered = false;
+    g_mouseNeedReplay = false;
     g_mouseButtonType.clear();
     g_mouseLongPressMs = 0;
 
