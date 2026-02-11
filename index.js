@@ -417,6 +417,30 @@ class UwpManager {
   }
 }
 
+// MUI 资源字符串解析类
+class MuiResolver {
+  /**
+   * 批量解析 MUI 资源字符串
+   * @param {string[]} refs - MUI 引用字符串数组，如 ['@%SystemRoot%\\system32\\shell32.dll,-22067']
+   * @returns {{ [ref: string]: string }} 解析结果对象，key 为原始引用，value 为解析后的本地化字符串
+   * @example
+   * const result = MuiResolver.resolve([
+   *   '@%SystemRoot%\\system32\\shell32.dll,-22067',
+   *   '@%SystemRoot%\\system32\\shell32.dll,-21769'
+   * ]);
+   * // { '@%SystemRoot%\\system32\\shell32.dll,-22067': '文件资源管理器', ... }
+   */
+  static resolve(refs) {
+    if (platform !== 'win32') {
+      throw new Error('MuiResolver is only supported on Windows');
+    }
+    if (!Array.isArray(refs)) {
+      throw new TypeError('refs must be an array of strings');
+    }
+    return addon.resolveMuiStrings(refs);
+  }
+}
+
 // 导出所有类
 module.exports = {
   ClipboardMonitor,
@@ -425,7 +449,8 @@ module.exports = {
   ScreenCapture,
   MouseMonitor,
   IconExtractor,
-  UwpManager
+  UwpManager,
+  MuiResolver
 };
 
 // 为了向后兼容，默认导出 ClipboardMonitor

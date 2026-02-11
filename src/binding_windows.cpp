@@ -2711,6 +2711,120 @@ Napi::Value GetFileIcon(const Napi::CallbackInfo& info) {
         env, reinterpret_cast<char*>(&data[0]), data.size());
 }
 
+// ==================== MUI 资源字符串解析 ====================
+
+// 从 DLL/MUI 文件加载字符串资源
+static std::wstring LoadStringFromModule(const std::wstring& modulePath, UINT resourceId) {
+    HMODULE hMod = LoadLibraryExW(modulePath.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    if (!hMod) return std::wstring();
+
+    WCHAR buf[1024] = {0};
+    int len = LoadStringW(hMod, resourceId, buf, 1024);
+    FreeLibrary(hMod);
+
+    if (len > 0) return std::wstring(buf, len);
+    return std::wstring();
+}
+
+// 解析单个 MUI 引用字符串，如 @%SystemRoot%\system32\shell32.dll,-22067
+static std::wstring ResolveSingleMui(const std::wstring& muiRef) {
+    if (muiRef.empty() || muiRef[0] != L'@') return std::wstring();
+
+    std::wstring rest = muiRef.substr(1);
+
+    // 找最后一个逗号分隔 dll 路径和资源 ID
+    auto commaPos = rest.rfind(L',');
+    if (commaPos == std::wstring::npos) return std::wstring();
+
+    std::wstring dllRaw = rest.substr(0, commaPos);
+    std::wstring idStr = rest.substr(commaPos + 1);
+
+    // 解析资源 ID（可能是负数）
+    if (!idStr.empty() && idStr[0] == L'-') {
+        idStr = idStr.substr(1);
+    }
+    UINT resourceId = 0;
+    for (auto c : idStr) {
+        if (c < L'0' || c > L'9') return std::wstring();
+        resourceId = resourceId * 10 + (c - L'0');
+    }
+
+    // 展开环境变量
+    WCHAR expandedPath[MAX_PATH] = {0};
+    ExpandEnvironmentStringsW(dllRaw.c_str(), expandedPath, MAX_PATH);
+
+    // 拆分目录和文件名
+    std::wstring fullPath(expandedPath);
+    std::wstring dir, fileName;
+    auto lastSlash = fullPath.rfind(L'\\');
+    if (lastSlash != std::wstring::npos) {
+        dir = fullPath.substr(0, lastSlash);
+        fileName = fullPath.substr(lastSlash + 1);
+    } else {
+        fileName = fullPath;
+    }
+
+    // 获取用户首选 UI 语言列表（含回退链，如 zh-CN -> zh -> en-US）
+    ULONG numLangs = 0;
+    ULONG bufSize = 0;
+    GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &numLangs, nullptr, &bufSize);
+    if (bufSize > 0) {
+        std::vector<WCHAR> langBuf(bufSize);
+        GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &numLangs, langBuf.data(), &bufSize);
+
+        // 遍历每种语言，尝试加载对应的 .mui 文件
+        const WCHAR* p = langBuf.data();
+        while (*p) {
+            std::wstring muiPath = dir + L"\\" + p + L"\\" + fileName + L".mui";
+            std::wstring result = LoadStringFromModule(muiPath, resourceId);
+            if (!result.empty()) return result;
+            p += wcslen(p) + 1;
+        }
+    }
+
+    // 回退：直接从 DLL 本体加载
+    return LoadStringFromModule(fullPath, resourceId);
+}
+
+// N-API: resolveMuiStrings(refs: string[]) => { [ref: string]: string }
+Napi::Value ResolveMuiStrings(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsArray()) {
+        Napi::TypeError::New(env, "Expected an array of MUI reference strings").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Array refs = info[0].As<Napi::Array>();
+    Napi::Object result = Napi::Object::New(env);
+
+    for (uint32_t i = 0; i < refs.Length(); i++) {
+        Napi::Value val = refs[i];
+        if (!val.IsString()) continue;
+
+        std::string refUtf8 = val.As<Napi::String>().Utf8Value();
+
+        // UTF-8 转宽字符
+        int wideSize = MultiByteToWideChar(CP_UTF8, 0, refUtf8.c_str(), -1, NULL, 0);
+        if (wideSize <= 0) continue;
+        std::wstring refWide(wideSize - 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, refUtf8.c_str(), -1, &refWide[0], wideSize);
+
+        std::wstring resolved = ResolveSingleMui(refWide);
+        if (resolved.empty()) continue;
+
+        // 宽字符转 UTF-8
+        int utf8Size = WideCharToMultiByte(CP_UTF8, 0, resolved.c_str(), -1, NULL, 0, NULL, NULL);
+        if (utf8Size <= 0) continue;
+        std::string resolvedUtf8(utf8Size - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, resolved.c_str(), -1, &resolvedUtf8[0], utf8Size, NULL, NULL);
+
+        result.Set(refUtf8, Napi::String::New(env, resolvedUtf8));
+    }
+
+    return result;
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -2729,6 +2843,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("getUwpApps", Napi::Function::New(env, GetUwpApps));
     exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
     exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
+    exports.Set("resolveMuiStrings", Napi::Function::New(env, ResolveMuiStrings));
     return exports;
 }
 
