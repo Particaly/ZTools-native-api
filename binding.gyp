@@ -34,7 +34,8 @@
               "psapi.lib",
               "shell32.lib",
               "shlwapi.lib",
-              "ole32.lib"
+              "ole32.lib",
+              "gdiplus.lib"
             ],
             "msvs_settings": {
               "VCCLCompilerTool": {

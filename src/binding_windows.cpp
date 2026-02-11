@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <windowsx.h>  // For GET_X_LPARAM, GET_Y_LPARAM
 #include <psapi.h>
+#include <commctrl.h>      // For image list
+#include <commoncontrols.h> // For IImageList
 #include <thread>
 #include <chrono>
 #include <string>
@@ -9,11 +11,22 @@
 #include <algorithm>   // For std::min, std::max
 #include <map>         // For key mapping
 #include <vector>      // For input events
-#include <shellapi.h>  // For DragQueryFile
+#include <memory>      // For std::unique_ptr, std::addressof
+#include <cstddef>
+#include <cwchar>
+#include <shellapi.h>  // For DragQueryFile, SHGetFileInfoW
 #include <shlobj.h>    // For SHLoadIndirectString, IApplicationActivationManager
 #include <shobjidl.h>  // For IApplicationActivationManager
 #include <appmodel.h>  // For package APIs
 #include <shlwapi.h>   // For PathCombineW
+
+// GDI+ 需要 min/max
+namespace Gdiplus {
+    using std::min;
+    using std::max;
+}
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 
 // DROPFILES 已由 shlobj.h 提供，不再需要手动定义
 
@@ -2371,6 +2384,333 @@ Napi::Value LaunchUwpApp(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, SUCCEEDED(hr));
 }
 
+// ==================== 应用图标提取 ====================
+
+// GDI+ 初始化/反初始化 RAII
+class GdiPlusInit {
+public:
+    GdiPlusInit() {
+        Gdiplus::GdiplusStartupInput startupInput;
+        Gdiplus::GdiplusStartup(std::addressof(this->token), std::addressof(startupInput), nullptr);
+    }
+    ~GdiPlusInit() { Gdiplus::GdiplusShutdown(this->token); }
+private:
+    GdiPlusInit(const GdiPlusInit&);
+    GdiPlusInit& operator=(const GdiPlusInit&);
+    ULONG_PTR token;
+};
+
+struct IStreamDeleter {
+    void operator()(IStream* pStream) const { pStream->Release(); }
+};
+
+// 从 HICON 创建带 Alpha 通道的 Bitmap
+static std::unique_ptr<Gdiplus::Bitmap> CreateBitmapFromIcon(
+    HICON hIcon, std::vector<std::int32_t>& buffer) {
+    ICONINFO iconInfo = {0};
+    GetIconInfo(hIcon, std::addressof(iconInfo));
+
+    BITMAP bm = {0};
+    GetObject(iconInfo.hbmColor, sizeof(bm), std::addressof(bm));
+
+    std::unique_ptr<Gdiplus::Bitmap> bitmap;
+
+    if (bm.bmBitsPixel == 32) {
+        auto hDC = GetDC(nullptr);
+
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = bm.bmWidth;
+        bmi.bmiHeader.biHeight = -bm.bmHeight;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        auto nBits = bm.bmWidth * bm.bmHeight;
+        buffer.resize(nBits);
+        GetDIBits(hDC, iconInfo.hbmColor, 0, bm.bmHeight,
+                  std::addressof(buffer[0]), std::addressof(bmi), DIB_RGB_COLORS);
+
+        auto hasAlpha = false;
+        for (std::int32_t i = 0; i < nBits; i++) {
+            if ((buffer[i] & 0xFF000000) != 0) {
+                hasAlpha = true;
+                break;
+            }
+        }
+
+        if (!hasAlpha) {
+            std::vector<std::int32_t> maskBits(nBits);
+            GetDIBits(hDC, iconInfo.hbmMask, 0, bm.bmHeight,
+                      std::addressof(maskBits[0]), std::addressof(bmi), DIB_RGB_COLORS);
+            for (std::int32_t i = 0; i < nBits; i++) {
+                if (maskBits[i] == 0) {
+                    buffer[i] |= 0xFF000000;
+                }
+            }
+        }
+
+        bitmap.reset(new Gdiplus::Bitmap(
+            bm.bmWidth, bm.bmHeight, bm.bmWidth * sizeof(std::int32_t),
+            PixelFormat32bppARGB,
+            static_cast<BYTE*>(static_cast<void*>(std::addressof(buffer[0])))));
+
+        ReleaseDC(nullptr, hDC);
+    } else {
+        bitmap.reset(Gdiplus::Bitmap::FromHICON(hIcon));
+    }
+
+    DeleteObject(iconInfo.hbmColor);
+    DeleteObject(iconInfo.hbmMask);
+
+    return bitmap;
+}
+
+// 获取 PNG 编码器 CLSID
+static int GetPngEncoderClsid(CLSID* pClsid) {
+    UINT num = 0u;
+    UINT size = 0u;
+    Gdiplus::GetImageEncodersSize(std::addressof(num), std::addressof(size));
+    if (size == 0u) return -1;
+
+    std::unique_ptr<Gdiplus::ImageCodecInfo> pImageCodecInfo(
+        static_cast<Gdiplus::ImageCodecInfo*>(static_cast<void*>(new BYTE[size])));
+    if (pImageCodecInfo == nullptr) return -1;
+
+    Gdiplus::GetImageEncoders(num, size, pImageCodecInfo.get());
+
+    for (UINT i = 0u; i < num; i++) {
+        if (std::wcscmp(pImageCodecInfo.get()[i].MimeType, L"image/png") == 0) {
+            *pClsid = pImageCodecInfo.get()[i].Clsid;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// 将 HICON 转换为 PNG 字节数组
+static std::vector<unsigned char> HIconToPNG(HICON hIcon) {
+    GdiPlusInit init;
+
+    std::vector<std::int32_t> buffer;
+    auto bitmap = CreateBitmapFromIcon(hIcon, buffer);
+
+    CLSID encoder;
+    if (GetPngEncoderClsid(std::addressof(encoder)) == -1) {
+        return std::vector<unsigned char>{};
+    }
+
+    IStream* tmp;
+    if (CreateStreamOnHGlobal(nullptr, TRUE, std::addressof(tmp)) != S_OK) {
+        return std::vector<unsigned char>{};
+    }
+    std::unique_ptr<IStream, IStreamDeleter> pStream{tmp};
+
+    if (bitmap->Save(pStream.get(), std::addressof(encoder), nullptr) != Gdiplus::Status::Ok) {
+        return std::vector<unsigned char>{};
+    }
+
+    STATSTG stg = {0};
+    LARGE_INTEGER offset = {0};
+    if (pStream->Stat(std::addressof(stg), STATFLAG_NONAME) != S_OK ||
+        pStream->Seek(offset, STREAM_SEEK_SET, nullptr) != S_OK) {
+        return std::vector<unsigned char>{};
+    }
+
+    std::vector<unsigned char> result(static_cast<std::size_t>(stg.cbSize.QuadPart));
+    ULONG ul;
+    if (pStream->Read(std::addressof(result[0]),
+                      static_cast<ULONG>(stg.cbSize.QuadPart), std::addressof(ul)) != S_OK ||
+        stg.cbSize.QuadPart != ul) {
+        return std::vector<unsigned char>{};
+    }
+
+    return result;
+}
+
+// .lnk 快捷方式解析结果
+struct LnkIconInfo {
+    std::wstring targetPath;    // 快捷方式目标路径
+    std::wstring iconLocation;  // 自定义图标路径
+    int iconIndex;              // 自定义图标索引
+};
+
+// 解析 .lnk 快捷方式（使用独立 STA 线程，IShellLink 需要 COM STA）
+static LnkIconInfo ResolveLnkInfo(const std::wstring& lnkPath) {
+    LnkIconInfo info = { L"", L"", 0 };
+
+    std::thread t([&lnkPath, &info]() {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+        IShellLinkW* pShellLink = nullptr;
+        IPersistFile* pPersistFile = nullptr;
+
+        HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_IShellLinkW, reinterpret_cast<void**>(&pShellLink));
+        if (SUCCEEDED(hr) && pShellLink) {
+            hr = pShellLink->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&pPersistFile));
+            if (SUCCEEDED(hr) && pPersistFile) {
+                hr = pPersistFile->Load(lnkPath.c_str(), STGM_READ);
+                if (SUCCEEDED(hr)) {
+                    // 获取自定义图标位置
+                    WCHAR iconPath[MAX_PATH] = {0};
+                    int iconIdx = 0;
+                    hr = pShellLink->GetIconLocation(iconPath, MAX_PATH, &iconIdx);
+                    if (SUCCEEDED(hr) && iconPath[0] != L'\0') {
+                        info.iconLocation = iconPath;
+                        info.iconIndex = iconIdx;
+                    }
+
+                    // 获取目标路径
+                    WCHAR targetPath[MAX_PATH] = {0};
+                    hr = pShellLink->GetPath(targetPath, MAX_PATH, nullptr, SLGP_RAWPATH);
+                    if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
+                        info.targetPath = targetPath;
+                    }
+                }
+                pPersistFile->Release();
+            }
+            pShellLink->Release();
+        }
+
+        CoUninitialize();
+    });
+    t.join();
+
+    return info;
+}
+
+// 判断文件扩展名是否为 .lnk（不区分大小写）
+static bool IsLnkFile(const std::wstring& path) {
+    if (path.size() < 4) return false;
+    std::wstring ext = path.substr(path.size() - 4);
+    for (auto& c : ext) c = towlower(c);
+    return ext == L".lnk";
+}
+
+// 从文件路径提取图标 (PNG Buffer)
+// 参数: path (string), size (number: 16 | 32 | 64 | 256)
+static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, int size) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    // UTF-8 转宽字符
+    int wideSize = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+    if (wideSize <= 0) {
+        CoUninitialize();
+        return std::vector<unsigned char>{};
+    }
+    std::wstring widePath(wideSize - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &widePath[0], wideSize);
+
+    // 如果是 .lnk 快捷方式，解析自定义图标或目标路径
+    if (IsLnkFile(widePath)) {
+        LnkIconInfo lnkInfo = ResolveLnkInfo(widePath);
+
+        // 优先使用快捷方式自定义图标（PrivateExtractIconsW 直接提取，无叠加箭头）
+        if (!lnkInfo.iconLocation.empty()) {
+            HICON hIcon = nullptr;
+            UINT extracted = PrivateExtractIconsW(
+                lnkInfo.iconLocation.c_str(), lnkInfo.iconIndex,
+                size, size, &hIcon, nullptr, 1, 0);
+            if (extracted > 0 && hIcon) {
+                auto pngData = HIconToPNG(hIcon);
+                DestroyIcon(hIcon);
+                CoUninitialize();
+                return pngData;
+            }
+        }
+
+        // 回退：使用目标路径（避免 SHGetFileInfoW 对 .lnk 叠加箭头）
+        if (!lnkInfo.targetPath.empty()) {
+            widePath = lnkInfo.targetPath;
+        }
+    }
+
+    UINT flag = SHGFI_ICON;
+
+    switch (size) {
+        case 16:
+            flag |= SHGFI_SMALLICON;
+            break;
+        case 32:
+            flag |= SHGFI_LARGEICON;
+            break;
+        case 64:
+        case 256:
+            flag |= SHGFI_SYSICONINDEX;
+            break;
+        default:
+            flag |= SHGFI_LARGEICON;
+            break;
+    }
+
+    SHFILEINFOW sfi = {0};
+    auto hr = SHGetFileInfoW(widePath.c_str(), 0, std::addressof(sfi), sizeof(sfi), flag);
+    HICON hIcon = nullptr;
+
+    if (hr == 0) {
+        CoUninitialize();
+        return std::vector<unsigned char>{};
+    }
+
+    if (size == 16 || size == 32) {
+        hIcon = sfi.hIcon;
+    } else {
+        HIMAGELIST* imageList;
+        hr = SHGetImageList(
+            size == 64 ? SHIL_EXTRALARGE : SHIL_JUMBO,
+            IID_IImageList,
+            static_cast<void**>(static_cast<void*>(std::addressof(imageList))));
+
+        if (FAILED(hr)) {
+            DestroyIcon(sfi.hIcon);
+            CoUninitialize();
+            return std::vector<unsigned char>{};
+        }
+
+        hr = static_cast<IImageList*>(static_cast<void*>(imageList))
+            ->GetIcon(sfi.iIcon, ILD_TRANSPARENT, std::addressof(hIcon));
+
+        DestroyIcon(sfi.hIcon);
+
+        if (FAILED(hr)) {
+            CoUninitialize();
+            return std::vector<unsigned char>{};
+        }
+    }
+
+    auto pngData = HIconToPNG(hIcon);
+    DestroyIcon(hIcon);
+    CoUninitialize();
+    return pngData;
+}
+
+// N-API: getFileIcon(path: string, size?: number) => Buffer<PNG>
+Napi::Value GetFileIcon(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected file path (string) as first argument").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string filePath = info[0].As<Napi::String>().Utf8Value();
+
+    int size = 32; // 默认 32x32
+    if (info.Length() >= 2 && info[1].IsNumber()) {
+        size = info[1].As<Napi::Number>().Int32Value();
+    }
+
+    auto data = ExtractIconFromPath(filePath, size);
+
+    if (data.empty()) {
+        return env.Null();
+    }
+
+    return Napi::Buffer<char>::Copy(
+        env, reinterpret_cast<char*>(&data[0]), data.size());
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -2388,6 +2728,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
     exports.Set("getUwpApps", Napi::Function::New(env, GetUwpApps));
     exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
+    exports.Set("getFileIcon", Napi::Function::New(env, GetFileIcon));
     return exports;
 }
 
