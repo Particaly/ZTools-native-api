@@ -32,7 +32,9 @@
               "user32.lib",
               "kernel32.lib",
               "psapi.lib",
-              "shell32.lib"
+              "shell32.lib",
+              "shlwapi.lib",
+              "ole32.lib"
             ],
             "msvs_settings": {
               "VCCLCompilerTool": {

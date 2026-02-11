@@ -10,16 +10,12 @@
 #include <map>         // For key mapping
 #include <vector>      // For input events
 #include <shellapi.h>  // For DragQueryFile
+#include <shlobj.h>    // For SHLoadIndirectString, IApplicationActivationManager
+#include <shobjidl.h>  // For IApplicationActivationManager
+#include <appmodel.h>  // For package APIs
+#include <shlwapi.h>   // For PathCombineW
 
-// 如果 DROPFILES 未定义，手动定义
-#ifndef DROPFILES
-typedef struct _DROPFILES {
-    DWORD pFiles;
-    POINT pt;
-    BOOL fNC;
-    BOOL fWide;
-} DROPFILES, *LPDROPFILES;
-#endif
+// DROPFILES 已由 shlobj.h 提供，不再需要手动定义
 
 // 取消与自定义函数名冲突的Windows宏
 #ifdef GetActiveWindow
@@ -1892,6 +1888,489 @@ Napi::Value SimulateKeyboardTap(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, result == eventCount);
 }
 
+// ==================== UWP 应用功能 ====================
+
+// 辅助函数：宽字符串转 UTF-8
+static std::string WideToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+    if (size <= 0) return "";
+    std::string utf8(size - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &utf8[0], size, NULL, NULL);
+    return utf8;
+}
+
+// 辅助函数：解码 XML 实体（&amp; &#xHHHH; &#DDD; 等）
+static std::wstring DecodeXmlEntities(const std::wstring& input) {
+    std::wstring result;
+    result.reserve(input.size());
+    size_t i = 0;
+    while (i < input.size()) {
+        if (input[i] == L'&') {
+            size_t semi = input.find(L';', i + 1);
+            if (semi != std::wstring::npos && semi - i < 12) {
+                std::wstring entity = input.substr(i + 1, semi - i - 1);
+                if (entity == L"amp") {
+                    result += L'&';
+                } else if (entity == L"lt") {
+                    result += L'<';
+                } else if (entity == L"gt") {
+                    result += L'>';
+                } else if (entity == L"quot") {
+                    result += L'"';
+                } else if (entity == L"apos") {
+                    result += L'\'';
+                } else if (entity.size() > 1 && entity[0] == L'#') {
+                    // 数字字符引用
+                    unsigned long codePoint = 0;
+                    if (entity[1] == L'x' || entity[1] == L'X') {
+                        // 十六进制 &#xHHHH;
+                        codePoint = wcstoul(entity.c_str() + 2, nullptr, 16);
+                    } else {
+                        // 十进制 &#DDDD;
+                        codePoint = wcstoul(entity.c_str() + 1, nullptr, 10);
+                    }
+                    if (codePoint > 0 && codePoint <= 0xFFFF) {
+                        result += static_cast<wchar_t>(codePoint);
+                    } else if (codePoint > 0xFFFF && codePoint <= 0x10FFFF) {
+                        // UTF-16 代理对
+                        codePoint -= 0x10000;
+                        result += static_cast<wchar_t>(0xD800 + (codePoint >> 10));
+                        result += static_cast<wchar_t>(0xDC00 + (codePoint & 0x3FF));
+                    } else {
+                        // 无效的代码点，保留原样
+                        result += input.substr(i, semi - i + 1);
+                    }
+                } else {
+                    // 未知实体，保留原样
+                    result += input.substr(i, semi - i + 1);
+                }
+                i = semi + 1;
+                continue;
+            }
+        }
+        result += input[i];
+        i++;
+    }
+    return result;
+}
+
+// 辅助函数：解析 ms-resource 间接字符串
+static std::wstring ResolveIndirectString(const std::wstring& raw, const std::wstring& packageFullName = L"", const std::wstring& msResource = L"") {
+    // 如果是 @{ 开头的间接字符串，使用 SHLoadIndirectString 解析
+    if (!raw.empty() && raw[0] == L'@') {
+        WCHAR resolved[512] = {0};
+        HRESULT hr = SHLoadIndirectString(raw.c_str(), resolved, 512, NULL);
+        if (SUCCEEDED(hr) && resolved[0] != L'\0') {
+            return std::wstring(resolved);
+        }
+    }
+    // 如果提供了 packageFullName 和 ms-resource，尝试构造间接字符串解析
+    if (!packageFullName.empty() && !msResource.empty()) {
+        // 尝试1: 直接用原始 ms-resource
+        // @{PackageFullName?ms-resource://PackageName/Resources/Name}
+        std::wstring indirectStr = L"@{" + packageFullName + L"?" + msResource + L"}";
+        WCHAR resolved[512] = {0};
+        HRESULT hr = SHLoadIndirectString(indirectStr.c_str(), resolved, 512, NULL);
+        if (SUCCEEDED(hr) && resolved[0] != L'\0') {
+            return std::wstring(resolved);
+        }
+
+        // 尝试2: 如果是短格式 ms-resource:Name，补全为 ms-resource:///Resources/Name
+        if (msResource.find(L"ms-resource:") == 0 && msResource.find(L"ms-resource://") == std::wstring::npos) {
+            std::wstring resourceName = msResource.substr(12); // 去掉 "ms-resource:"
+            // 可能包含路径如 ms-resource:Clipchamp/AppName
+            std::wstring fullResource = L"ms-resource:///Resources/" + resourceName;
+            indirectStr = L"@{" + packageFullName + L"?" + fullResource + L"}";
+            memset(resolved, 0, sizeof(resolved));
+            hr = SHLoadIndirectString(indirectStr.c_str(), resolved, 512, NULL);
+            if (SUCCEEDED(hr) && resolved[0] != L'\0') {
+                return std::wstring(resolved);
+            }
+
+            // 尝试3: ms-resource:///Name（不加 Resources 前缀）
+            fullResource = L"ms-resource:///" + resourceName;
+            indirectStr = L"@{" + packageFullName + L"?" + fullResource + L"}";
+            memset(resolved, 0, sizeof(resolved));
+            hr = SHLoadIndirectString(indirectStr.c_str(), resolved, 512, NULL);
+            if (SUCCEEDED(hr) && resolved[0] != L'\0') {
+                return std::wstring(resolved);
+            }
+        }
+    }
+    // 如果以 @ 开头且无法解析，返回空字符串（表示解析失败）
+    if (!raw.empty() && raw[0] == L'@') {
+        return L"";
+    }
+    return raw;
+}
+
+// 辅助函数：查找应用图标的最佳路径
+static std::wstring FindBestLogo(const std::wstring& installLocation, const std::wstring& logoRelPath) {
+    if (installLocation.empty() || logoRelPath.empty()) return L"";
+
+    // 构建完整路径
+    std::wstring fullPath = installLocation + L"\\" + logoRelPath;
+
+    // 检查原路径是否直接存在
+    if (GetFileAttributesW(fullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return fullPath;
+    }
+
+    // UWP 图标常见的缩放后缀变体
+    // 例如 Assets\StoreLogo.png -> Assets\StoreLogo.scale-100.png
+    size_t dotPos = fullPath.find_last_of(L'.');
+    if (dotPos == std::wstring::npos) return L"";
+
+    std::wstring basePath = fullPath.substr(0, dotPos);
+    std::wstring ext = fullPath.substr(dotPos);
+
+    // 按照优先级尝试不同的 scale 后缀
+    const wchar_t* scales[] = {
+        L".scale-100", L".scale-125", L".scale-150",
+        L".scale-200", L".scale-400"
+    };
+
+    for (const wchar_t* scale : scales) {
+        std::wstring candidate = basePath + scale + ext;
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return candidate;
+        }
+    }
+
+    // 尝试 targetsize 变体
+    const wchar_t* sizes[] = {
+        L".targetsize-48", L".targetsize-64", L".targetsize-96",
+        L".targetsize-256", L".targetsize-32", L".targetsize-24",
+        L".targetsize-16"
+    };
+
+    for (const wchar_t* sz : sizes) {
+        std::wstring candidate = basePath + sz + ext;
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return candidate;
+        }
+    }
+
+    // 尝试 altform-unplated 变体
+    for (const wchar_t* sz : sizes) {
+        std::wstring candidate = basePath + sz + L"_altform-unplated" + ext;
+        if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return candidate;
+        }
+    }
+
+    return L"";
+}
+
+// 辅助函数：从包全名提取 PackageFamilyName
+// 包全名格式: Name_Version_Arch_ResourceId_PublisherId 或 Name_Version_Arch__PublisherId
+// PackageFamilyName: Name_PublisherId
+static std::wstring GetPackageFamilyNameFromFullName(const std::wstring& fullName) {
+    // 找到第一个下划线（Name 结尾）
+    size_t firstUnderscore = fullName.find(L'_');
+    if (firstUnderscore == std::wstring::npos) return fullName;
+
+    std::wstring name = fullName.substr(0, firstUnderscore);
+
+    // 找到最后一个下划线后面的 PublisherId
+    size_t lastUnderscore = fullName.find_last_of(L'_');
+    if (lastUnderscore == std::wstring::npos || lastUnderscore == firstUnderscore) return fullName;
+
+    std::wstring publisherId = fullName.substr(lastUnderscore + 1);
+
+    return name + L"_" + publisherId;
+}
+
+// 辅助函数：简单 XML 属性提取
+static std::wstring GetXmlAttribute(const std::wstring& xml, const std::wstring& tag, const std::wstring& attr) {
+    // 查找 <tag ... attr="value" ...>
+    size_t searchPos = 0;
+    while (searchPos < xml.size()) {
+        size_t tagStart = xml.find(L"<" + tag, searchPos);
+        if (tagStart == std::wstring::npos) break;
+
+        size_t tagEnd = xml.find(L'>', tagStart);
+        if (tagEnd == std::wstring::npos) break;
+
+        std::wstring tagContent = xml.substr(tagStart, tagEnd - tagStart + 1);
+        std::wstring attrSearch = attr + L"=\"";
+        size_t attrPos = tagContent.find(attrSearch);
+        if (attrPos != std::wstring::npos) {
+            size_t valueStart = attrPos + attrSearch.length();
+            size_t valueEnd = tagContent.find(L'"', valueStart);
+            if (valueEnd != std::wstring::npos) {
+                return tagContent.substr(valueStart, valueEnd - valueStart);
+            }
+        }
+        searchPos = tagEnd + 1;
+    }
+    return L"";
+}
+
+// 辅助函数：读取文件内容为宽字符串
+static std::wstring ReadFileToWString(const std::wstring& path) {
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return L"";
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
+        CloseHandle(hFile);
+        return L"";
+    }
+
+    std::vector<char> buffer(fileSize + 1, 0);
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, buffer.data(), fileSize, &bytesRead, NULL)) {
+        CloseHandle(hFile);
+        return L"";
+    }
+    CloseHandle(hFile);
+
+    // 将 UTF-8 转换为宽字符串
+    int wideLen = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), bytesRead, NULL, 0);
+    if (wideLen <= 0) return L"";
+
+    std::wstring result(wideLen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, buffer.data(), bytesRead, &result[0], wideLen);
+    return result;
+}
+
+// 获取 UWP 应用列表
+Napi::Value GetUwpApps(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Array result = Napi::Array::New(env);
+
+    // 打开注册表枚举已安装的 UWP 包
+    HKEY hKeyRepo = NULL;
+    LONG regResult = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages",
+        0, KEY_READ, &hKeyRepo
+    );
+
+    if (regResult != ERROR_SUCCESS) {
+        return result;
+    }
+
+    DWORD subKeyCount = 0;
+    RegQueryInfoKeyW(hKeyRepo, NULL, NULL, NULL, &subKeyCount, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+    uint32_t appIndex = 0;
+
+    for (DWORD i = 0; i < subKeyCount; i++) {
+        WCHAR subKeyName[512] = {0};
+        DWORD subKeyNameLen = 512;
+        if (RegEnumKeyExW(hKeyRepo, i, subKeyName, &subKeyNameLen, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+            continue;
+        }
+
+        // 打开包子键
+        HKEY hKeyPkg = NULL;
+        if (RegOpenKeyExW(hKeyRepo, subKeyName, 0, KEY_READ, &hKeyPkg) != ERROR_SUCCESS) {
+            continue;
+        }
+
+        // 读取 PackageRootFolder（安装路径）
+        WCHAR installLocation[1024] = {0};
+        DWORD installLocSize = sizeof(installLocation);
+        if (RegQueryValueExW(hKeyPkg, L"PackageRootFolder", NULL, NULL, (LPBYTE)installLocation, &installLocSize) != ERROR_SUCCESS) {
+            RegCloseKey(hKeyPkg);
+            continue;
+        }
+
+        // 读取 DisplayName（可能是 @{...?ms-resource:...} 间接字符串）
+        WCHAR displayName[512] = {0};
+        DWORD displayNameSize = sizeof(displayName);
+        RegQueryValueExW(hKeyPkg, L"DisplayName", NULL, NULL, (LPBYTE)displayName, &displayNameSize);
+
+        RegCloseKey(hKeyPkg);
+
+        // 读取 AppxManifest.xml
+        std::wstring manifestPath = std::wstring(installLocation) + L"\\AppxManifest.xml";
+        std::wstring manifestContent = ReadFileToWString(manifestPath);
+        if (manifestContent.empty()) {
+            continue;
+        }
+
+        // 跳过没有 <Applications> 的框架包
+        if (manifestContent.find(L"<Applications>") == std::wstring::npos) {
+            continue;
+        }
+
+        // 提取 PackageFamilyName
+        std::wstring packageFullName(subKeyName);
+        std::wstring familyName = GetPackageFamilyNameFromFullName(packageFullName);
+
+        // 解析 DisplayName
+        // 先尝试从 manifest 中获取 DisplayName 的 ms-resource 用于更好的解析
+        std::wstring manifestDisplayName = GetXmlAttribute(manifestContent, L"Properties", L"");
+        // 从 <DisplayName> 标签中获取值
+        size_t dnStart = manifestContent.find(L"<DisplayName>");
+        size_t dnEnd = manifestContent.find(L"</DisplayName>");
+        std::wstring msResourceName;
+        if (dnStart != std::wstring::npos && dnEnd != std::wstring::npos) {
+            dnStart += 13; // len("<DisplayName>")
+            msResourceName = DecodeXmlEntities(manifestContent.substr(dnStart, dnEnd - dnStart));
+        }
+
+        std::wstring resolvedName = ResolveIndirectString(std::wstring(displayName), packageFullName, msResourceName);
+        if (resolvedName.empty() && !msResourceName.empty()) {
+            // 再尝试用 manifest 的 ms-resource
+            resolvedName = ResolveIndirectString(L"", packageFullName, msResourceName);
+        }
+        if (resolvedName.empty()) {
+            resolvedName = familyName;
+        }
+        // 解码包级别名称中可能存在的 XML 实体
+        resolvedName = DecodeXmlEntities(resolvedName);
+
+        // 从 manifest 中提取所有 Application 条目
+        size_t searchPos = 0;
+        while (searchPos < manifestContent.size()) {
+            size_t appTagStart = manifestContent.find(L"<Application ", searchPos);
+            if (appTagStart == std::wstring::npos) break;
+
+            // 找到这个 Application 标签结束的位置
+            size_t appBlockEnd = manifestContent.find(L"</Application>", appTagStart);
+            if (appBlockEnd == std::wstring::npos) {
+                // 可能是自闭合标签
+                appBlockEnd = manifestContent.find(L"/>", appTagStart);
+                if (appBlockEnd == std::wstring::npos) break;
+                appBlockEnd += 2;
+            } else {
+                appBlockEnd += 14; // len("</Application>")
+            }
+
+            std::wstring appBlock = manifestContent.substr(appTagStart, appBlockEnd - appTagStart);
+
+            // 提取 Application Id
+            std::wstring appId = GetXmlAttribute(appBlock, L"Application", L"Id");
+            if (appId.empty()) {
+                searchPos = appBlockEnd;
+                continue;
+            }
+
+            // 检查 AppListEntry 属性，跳过标记为 "none" 的内部入口
+            std::wstring appListEntry = GetXmlAttribute(appBlock, L"uap:VisualElements", L"AppListEntry");
+            if (appListEntry.empty()) {
+                appListEntry = GetXmlAttribute(appBlock, L"VisualElements", L"AppListEntry");
+            }
+            if (appListEntry == L"none") {
+                searchPos = appBlockEnd;
+                continue;
+            }
+
+            // 构建 AppUserModelID: PackageFamilyName!ApplicationId
+            std::wstring aumid = familyName + L"!" + appId;
+
+            // 优先从 Application 的 VisualElements 中读取 DisplayName（每个入口可能不同）
+            std::wstring appDisplayName;
+            std::wstring veDisplayName = GetXmlAttribute(appBlock, L"uap:VisualElements", L"DisplayName");
+            if (veDisplayName.empty()) {
+                veDisplayName = GetXmlAttribute(appBlock, L"VisualElements", L"DisplayName");
+            }
+            if (!veDisplayName.empty()) {
+                // 先解码 XML 实体（如 &amp; &#x7535; 等）
+                veDisplayName = DecodeXmlEntities(veDisplayName);
+                // 可能是 ms-resource:XXX 格式，需要解析
+                if (veDisplayName.find(L"ms-resource:") == 0) {
+                    appDisplayName = ResolveIndirectString(L"", packageFullName, veDisplayName);
+                } else {
+                    appDisplayName = veDisplayName;
+                }
+            }
+            // 如果 VisualElements 中解析失败，回退到包级别名称
+            if (appDisplayName.empty()) {
+                appDisplayName = resolvedName;
+            }
+
+            // 提取图标路径（从 VisualElements 或 uap:VisualElements）
+            std::wstring logoRelPath;
+            // 先尝试 Square44x44Logo（应用列表图标）
+            logoRelPath = GetXmlAttribute(appBlock, L"uap:VisualElements", L"Square44x44Logo");
+            if (logoRelPath.empty()) {
+                logoRelPath = GetXmlAttribute(appBlock, L"VisualElements", L"Square44x44Logo");
+            }
+            // 如果没有 44x44，尝试 150x150
+            if (logoRelPath.empty()) {
+                logoRelPath = GetXmlAttribute(appBlock, L"uap:VisualElements", L"Square150x150Logo");
+                if (logoRelPath.empty()) {
+                    logoRelPath = GetXmlAttribute(appBlock, L"VisualElements", L"Square150x150Logo");
+                }
+            }
+
+            // 查找实际的图标文件
+            std::wstring iconFullPath = FindBestLogo(std::wstring(installLocation), logoRelPath);
+
+            // 跳过没有图标的应用（通常是系统基础设施组件，如 Win32WebViewHost）
+            if (iconFullPath.empty()) {
+                searchPos = appBlockEnd;
+                continue;
+            }
+
+            // 创建应用信息对象
+            Napi::Object appInfo = Napi::Object::New(env);
+            appInfo.Set("name", Napi::String::New(env, WideToUtf8(appDisplayName)));
+            appInfo.Set("appId", Napi::String::New(env, WideToUtf8(aumid)));
+            appInfo.Set("icon", Napi::String::New(env, WideToUtf8(iconFullPath)));
+            appInfo.Set("installLocation", Napi::String::New(env, WideToUtf8(std::wstring(installLocation))));
+
+            result.Set(appIndex++, appInfo);
+
+            searchPos = appBlockEnd;
+        }
+    }
+
+    RegCloseKey(hKeyRepo);
+    return result;
+}
+
+// 启动 UWP 应用
+Napi::Value LaunchUwpApp(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Expected appId (AppUserModelID) as first argument").ThrowAsJavaScriptException();
+        return Napi::Boolean::New(env, false);
+    }
+
+    std::string appIdUtf8 = info[0].As<Napi::String>().Utf8Value();
+
+    // 转换为宽字符
+    int wideSize = MultiByteToWideChar(CP_UTF8, 0, appIdUtf8.c_str(), -1, NULL, 0);
+    if (wideSize <= 0) {
+        return Napi::Boolean::New(env, false);
+    }
+    std::wstring appIdWide(wideSize - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, appIdUtf8.c_str(), -1, &appIdWide[0], wideSize);
+
+    // 使用 IApplicationActivationManager 启动 UWP 应用
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    IApplicationActivationManager* paam = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_ApplicationActivationManager,
+        nullptr,
+        CLSCTX_LOCAL_SERVER,
+        IID_IApplicationActivationManager,
+        (void**)&paam
+    );
+
+    if (FAILED(hr) || paam == nullptr) {
+        CoUninitialize();
+        return Napi::Boolean::New(env, false);
+    }
+
+    DWORD pid = 0;
+    hr = paam->ActivateApplication(appIdWide.c_str(), nullptr, AO_NONE, &pid);
+
+    paam->Release();
+    CoUninitialize();
+
+    return Napi::Boolean::New(env, SUCCEEDED(hr));
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -1907,6 +2386,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("setClipboardFiles", Napi::Function::New(env, SetClipboardFiles));
     exports.Set("startMouseMonitor", Napi::Function::New(env, StartMouseMonitor));
     exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
+    exports.Set("getUwpApps", Napi::Function::New(env, GetUwpApps));
+    exports.Set("launchUwpApp", Napi::Function::New(env, LaunchUwpApp));
     return exports;
 }
 
