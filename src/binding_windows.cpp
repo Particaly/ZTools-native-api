@@ -2533,11 +2533,12 @@ struct LnkIconInfo {
     std::wstring targetPath;    // 快捷方式目标路径
     std::wstring iconLocation;  // 自定义图标路径
     int iconIndex;              // 自定义图标索引
+    DWORD targetAttributes;     // 目标文件属性（来自 .lnk 存储的数据）
 };
 
 // 解析 .lnk 快捷方式（使用独立 STA 线程，IShellLink 需要 COM STA）
 static LnkIconInfo ResolveLnkInfo(const std::wstring& lnkPath) {
-    LnkIconInfo info = { L"", L"", 0 };
+    LnkIconInfo info = { L"", L"", 0, 0 };
 
     std::thread t([&lnkPath, &info]() {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -2557,15 +2558,24 @@ static LnkIconInfo ResolveLnkInfo(const std::wstring& lnkPath) {
                     int iconIdx = 0;
                     hr = pShellLink->GetIconLocation(iconPath, MAX_PATH, &iconIdx);
                     if (SUCCEEDED(hr) && iconPath[0] != L'\0') {
-                        info.iconLocation = iconPath;
+                        // 展开环境变量（如 %SystemRoot%）
+                        WCHAR expandedIconPath[MAX_PATH] = {0};
+                        DWORD expandedLen = ExpandEnvironmentStringsW(iconPath, expandedIconPath, MAX_PATH);
+                        if (expandedLen > 0 && expandedLen <= MAX_PATH) {
+                            info.iconLocation = expandedIconPath;
+                        } else {
+                            info.iconLocation = iconPath;
+                        }
                         info.iconIndex = iconIdx;
                     }
 
-                    // 获取目标路径
+                    // 获取目标路径（使用默认标志以展开环境变量）
                     WCHAR targetPath[MAX_PATH] = {0};
-                    hr = pShellLink->GetPath(targetPath, MAX_PATH, nullptr, SLGP_RAWPATH);
+                    WIN32_FIND_DATAW findData = {0};
+                    hr = pShellLink->GetPath(targetPath, MAX_PATH, &findData, 0);
                     if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
                         info.targetPath = targetPath;
+                        info.targetAttributes = findData.dwFileAttributes;
                     }
                 }
                 pPersistFile->Release();
@@ -2588,6 +2598,20 @@ static bool IsLnkFile(const std::wstring& path) {
     return ext == L".lnk";
 }
 
+// 判断是否为网络路径（UNC 路径或映射的网络驱动器）
+static bool IsNetworkPath(const std::wstring& path) {
+    // UNC 路径: \\server\share\...
+    if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+        return true;
+    }
+    // 映射的网络驱动器: Z:\...
+    if (path.size() >= 3 && iswalpha(path[0]) && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+        std::wstring root = path.substr(0, 3);
+        return GetDriveTypeW(root.c_str()) == DRIVE_REMOTE;
+    }
+    return false;
+}
+
 // 从文件路径提取图标 (PNG Buffer)
 // 参数: path (string), size (number: 16 | 32 | 64 | 256)
 static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, int size) {
@@ -2603,11 +2627,13 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
     MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &widePath[0], wideSize);
 
     // 如果是 .lnk 快捷方式，解析自定义图标或目标路径
+    DWORD targetAttrs = 0;
     if (IsLnkFile(widePath)) {
         LnkIconInfo lnkInfo = ResolveLnkInfo(widePath);
 
         // 优先使用快捷方式自定义图标（PrivateExtractIconsW 直接提取，无叠加箭头）
-        if (!lnkInfo.iconLocation.empty()) {
+        // 跳过网络路径上的图标文件，避免网络不可达时长时间阻塞
+        if (!lnkInfo.iconLocation.empty() && !IsNetworkPath(lnkInfo.iconLocation)) {
             HICON hIcon = nullptr;
             UINT extracted = PrivateExtractIconsW(
                 lnkInfo.iconLocation.c_str(), lnkInfo.iconIndex,
@@ -2623,6 +2649,7 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
         // 回退：使用目标路径（避免 SHGetFileInfoW 对 .lnk 叠加箭头）
         if (!lnkInfo.targetPath.empty()) {
             widePath = lnkInfo.targetPath;
+            targetAttrs = lnkInfo.targetAttributes;
         }
     }
 
@@ -2645,35 +2672,53 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
     }
 
     SHFILEINFOW sfi = {0};
-    auto hr = SHGetFileInfoW(widePath.c_str(), 0, std::addressof(sfi), sizeof(sfi), flag);
     HICON hIcon = nullptr;
 
-    if (hr == 0) {
-        CoUninitialize();
-        return std::vector<unsigned char>{};
+    // 网络路径优化：使用 SHGFI_USEFILEATTRIBUTES 根据扩展名获取关联图标，避免网络 I/O
+    bool isNetwork = IsNetworkPath(widePath);
+    if (isNetwork) {
+        DWORD fileAttr = (targetAttrs != 0) ? targetAttrs : FILE_ATTRIBUTE_NORMAL;
+        auto hr = SHGetFileInfoW(widePath.c_str(), fileAttr,
+            std::addressof(sfi), sizeof(sfi), flag | SHGFI_USEFILEATTRIBUTES);
+        if (hr == 0) {
+            CoUninitialize();
+            return std::vector<unsigned char>{};
+        }
+    } else {
+        auto hr = SHGetFileInfoW(widePath.c_str(), 0, std::addressof(sfi), sizeof(sfi), flag);
+        if (hr == 0) {
+            // 回退：文件不存在或路径无效时，根据扩展名获取关联图标
+            memset(&sfi, 0, sizeof(sfi));
+            hr = SHGetFileInfoW(widePath.c_str(), FILE_ATTRIBUTE_NORMAL,
+                std::addressof(sfi), sizeof(sfi), flag | SHGFI_USEFILEATTRIBUTES);
+            if (hr == 0) {
+                CoUninitialize();
+                return std::vector<unsigned char>{};
+            }
+        }
     }
 
     if (size == 16 || size == 32) {
         hIcon = sfi.hIcon;
     } else {
         HIMAGELIST* imageList;
-        hr = SHGetImageList(
+        HRESULT hrImg = SHGetImageList(
             size == 64 ? SHIL_EXTRALARGE : SHIL_JUMBO,
             IID_IImageList,
             static_cast<void**>(static_cast<void*>(std::addressof(imageList))));
 
-        if (FAILED(hr)) {
+        if (FAILED(hrImg)) {
             DestroyIcon(sfi.hIcon);
             CoUninitialize();
             return std::vector<unsigned char>{};
         }
 
-        hr = static_cast<IImageList*>(static_cast<void*>(imageList))
+        hrImg = static_cast<IImageList*>(static_cast<void*>(imageList))
             ->GetIcon(sfi.iIcon, ILD_TRANSPARENT, std::addressof(hIcon));
 
         DestroyIcon(sfi.hIcon);
 
-        if (FAILED(hr)) {
+        if (FAILED(hrImg)) {
             CoUninitialize();
             return std::vector<unsigned char>{};
         }

@@ -6,7 +6,7 @@ console.log('\n' + '='.repeat(60));
 console.log('  IconExtractor 测试');
 console.log('='.repeat(60) + '\n');
 
-const lnkPath = 'C:\\Users\\Admin\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\System Tools\\File Explorer.lnk';
+const lnkPath = 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\LibreOffice\\LibreOffice.lnk';
 const outputDir = path.join(__dirname, 'output');
 
 // 创建输出目录
