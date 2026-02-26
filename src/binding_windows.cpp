@@ -2615,12 +2615,10 @@ static bool IsNetworkPath(const std::wstring& path) {
 // 从文件路径提取图标 (PNG Buffer)
 // 参数: path (string), size (number: 16 | 32 | 64 | 256)
 static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, int size) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     // UTF-8 转宽字符
     int wideSize = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
     if (wideSize <= 0) {
-        CoUninitialize();
         return std::vector<unsigned char>{};
     }
     std::wstring widePath(wideSize - 1, L'\0');
@@ -2641,7 +2639,6 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
             if (extracted > 0 && hIcon) {
                 auto pngData = HIconToPNG(hIcon);
                 DestroyIcon(hIcon);
-                CoUninitialize();
                 return pngData;
             }
         }
@@ -2681,7 +2678,6 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
         auto hr = SHGetFileInfoW(widePath.c_str(), fileAttr,
             std::addressof(sfi), sizeof(sfi), flag | SHGFI_USEFILEATTRIBUTES);
         if (hr == 0) {
-            CoUninitialize();
             return std::vector<unsigned char>{};
         }
     } else {
@@ -2692,7 +2688,6 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
             hr = SHGetFileInfoW(widePath.c_str(), FILE_ATTRIBUTE_NORMAL,
                 std::addressof(sfi), sizeof(sfi), flag | SHGFI_USEFILEATTRIBUTES);
             if (hr == 0) {
-                CoUninitialize();
                 return std::vector<unsigned char>{};
             }
         }
@@ -2709,7 +2704,6 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
 
         if (FAILED(hrImg)) {
             DestroyIcon(sfi.hIcon);
-            CoUninitialize();
             return std::vector<unsigned char>{};
         }
 
@@ -2719,14 +2713,12 @@ static std::vector<unsigned char> ExtractIconFromPath(const std::string& path, i
         DestroyIcon(sfi.hIcon);
 
         if (FAILED(hrImg)) {
-            CoUninitialize();
             return std::vector<unsigned char>{};
         }
     }
 
     auto pngData = HIconToPNG(hIcon);
     DestroyIcon(hIcon);
-    CoUninitialize();
     return pngData;
 }
 
