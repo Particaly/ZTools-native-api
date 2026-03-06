@@ -901,16 +901,71 @@ static double GetDpiScaleFactor() {
     return 1.0;
 }
 
+// 显示器枚举回调数据
+struct MonitorEnumData {
+    LONG minLeft, minTop, maxRight, maxBottom;
+    double totalDpiScale;
+    int monitorCount;
+};
+
+// 显示器枚举回调
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData) {
+    MonitorEnumData* data = reinterpret_cast<MonitorEnumData*>(dwData);
+
+    // 获取显示器的物理尺寸
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(MONITORINFOEXW);
+    if (GetMonitorInfoW(hMonitor, &mi)) {
+        // 在 DPI 感知模式下，rcMonitor 已经是物理像素坐标
+        data->minLeft = (std::min)(data->minLeft, mi.rcMonitor.left);
+        data->minTop = (std::min)(data->minTop, mi.rcMonitor.top);
+        data->maxRight = (std::max)(data->maxRight, mi.rcMonitor.right);
+        data->maxBottom = (std::max)(data->maxBottom, mi.rcMonitor.bottom);
+        data->monitorCount++;
+
+        // 获取显示器 DPI
+        typedef HRESULT(WINAPI* GetDpiForMonitorProc)(HMONITOR, int, UINT*, UINT*);
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        if (shcore) {
+            auto getDpiForMonitor = (GetDpiForMonitorProc)GetProcAddress(shcore, "GetDpiForMonitor");
+            if (getDpiForMonitor) {
+                UINT dpiX, dpiY;
+                if (SUCCEEDED(getDpiForMonitor(hMonitor, 0/*MDT_EFFECTIVE_DPI*/, &dpiX, &dpiY))) {
+                    data->totalDpiScale = (std::max)(data->totalDpiScale, dpiX / 96.0);
+                }
+            }
+            FreeLibrary(shcore);
+        }
+    }
+    return TRUE;
+}
+
 // 截取整个虚拟屏幕到物理尺寸位图
 static bool CaptureVirtualScreen(HDC& outMemDC, HBITMAP& outBitmap,
-    int& vx, int& vy, int& vw, int& vh, double dpiScale) {
+    int& vx, int& vy, int& vw, int& vh, double& dpiScale) {
+    // 获取逻辑坐标的虚拟屏幕尺寸
     vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
     vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
-    int pw = (int)(vw * dpiScale + 0.5);
-    int ph = (int)(vh * dpiScale + 0.5);
+    // 枚举所有显示器获取物理像素边界
+    MonitorEnumData enumData = { INT_MAX, INT_MAX, INT_MIN, INT_MIN, 1.0, 0 };
+    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&enumData));
+
+    // 计算物理尺寸（使用枚举得到的实际物理像素边界）
+    int physVx = enumData.minLeft;
+    int physVy = enumData.minTop;
+    int physVw = enumData.maxRight - enumData.minLeft;
+    int physVh = enumData.maxBottom - enumData.minTop;
+
+    // 如果枚举失败，回退到 DPI 缩放计算
+    if (physVw <= 0 || physVh <= 0 || enumData.monitorCount == 0) {
+        physVx = (int)(vx * dpiScale);
+        physVy = (int)(vy * dpiScale);
+        physVw = (int)(vw * dpiScale + 0.5);
+        physVh = (int)(vh * dpiScale + 0.5);
+    }
 
     HDC screenDC = GetDC(NULL);
     if (!screenDC) return false;
@@ -918,15 +973,22 @@ static bool CaptureVirtualScreen(HDC& outMemDC, HBITMAP& outBitmap,
     outMemDC = CreateCompatibleDC(screenDC);
     if (!outMemDC) { ReleaseDC(NULL, screenDC); return false; }
 
-    outBitmap = CreateCompatibleBitmap(screenDC, pw, ph);
+    outBitmap = CreateCompatibleBitmap(screenDC, physVw, physVh);
     if (!outBitmap) { DeleteDC(outMemDC); ReleaseDC(NULL, screenDC); return false; }
 
     SelectObject(outMemDC, outBitmap);
 
-    if (dpiScale > 1.01 || dpiScale < 0.99) {
-        StretchBlt(outMemDC, 0, 0, pw, ph, screenDC, vx, vy, vw, vh, SRCCOPY);
-    } else {
-        BitBlt(outMemDC, 0, 0, vw, vh, screenDC, vx, vy, SRCCOPY);
+    // 设置高质量拉伸模式
+    SetStretchBltMode(outMemDC, HALFTONE);
+    SetBrushOrgEx(outMemDC, 0, 0, NULL);
+
+    // 直接 BitBlt 物理像素（在 DPI 感知模式下，屏幕 DC 和坐标都是物理像素级别）
+    BitBlt(outMemDC, 0, 0, physVw, physVh, screenDC, physVx, physVy, SRCCOPY);
+
+    // 更新返回的 dpiScale 为实际的物理/逻辑比例
+    // 这样后续的坐标转换才能正确
+    if (vw > 0 && vh > 0) {
+        dpiScale = (double)physVw / vw;
     }
 
     ReleaseDC(NULL, screenDC);
@@ -1437,9 +1499,24 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
         }
 
         // 绘制窗口高亮（Idle 状态）
-        if (ctx->state == CS_Idle && ctx->hoveredWindow >= 0 && ctx->hoveredWindow < (int)ctx->windows.size()) {
-            DrawWindowHighlight(backDC, ctx->windows[ctx->hoveredWindow].rect,
-                ctx->virtualX, ctx->virtualY, ctx->gdi);
+        if (ctx->state == CS_Idle) {
+            if (ctx->hoveredWindow >= 0 && ctx->hoveredWindow < (int)ctx->windows.size()) {
+                // 高亮悬停的窗口
+                DrawWindowHighlight(backDC, ctx->windows[ctx->hoveredWindow].rect,
+                    ctx->virtualX, ctx->virtualY, ctx->gdi);
+            } else {
+                // 没有匹配到窗口时，高亮鼠标所在的屏幕
+                POINT pt = { ctx->mouseX, ctx->mouseY };
+                HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (hMonitor) {
+                    MONITORINFO monitorInfo;
+                    monitorInfo.cbSize = sizeof(MONITORINFO);
+                    if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+                        DrawWindowHighlight(backDC, monitorInfo.rcMonitor,
+                            ctx->virtualX, ctx->virtualY, ctx->gdi);
+                    }
+                }
+            }
         }
 
         // 绘制选区或窗口尺寸标签
@@ -1448,20 +1525,34 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
             curLabelRect = DrawSelection(backDC, ctx->startX, ctx->startY, ctx->endX, ctx->endY,
                 ctx->virtualX, ctx->virtualY, ctx->virtualW, ctx->virtualH, ctx->gdi);
         } else if (ctx->state == CS_Idle) {
+            RECT screenRect;
+            int ww, wh;
+
             if (ctx->hoveredWindow >= 0 && ctx->hoveredWindow < (int)ctx->windows.size()) {
+                // 显示悬停窗口的尺寸
                 const RECT& wr = ctx->windows[ctx->hoveredWindow].rect;
-                int ww = wr.right - wr.left;
-                int wh = wr.bottom - wr.top;
-                curLabelRect = DrawSizeLabel(backDC, ww, wh,
-                    wr.left - ctx->virtualX, wr.top - ctx->virtualY,
-                    wr.right - ctx->virtualX, wr.bottom - ctx->virtualY,
-                    ctx->virtualW, ctx->virtualH, ctx->gdi);
+                ww = wr.right - wr.left;
+                wh = wr.bottom - wr.top;
+                screenRect = wr;
             } else {
-                int mxr = ctx->mouseX - ctx->virtualX;
-                int myr = ctx->mouseY - ctx->virtualY;
-                curLabelRect = DrawSizeLabel(backDC, 0, 0, mxr, myr, mxr+1, myr+1,
-                    ctx->virtualW, ctx->virtualH, ctx->gdi);
+                // 没有匹配到窗口时，显示当前屏幕的尺寸
+                POINT pt = { ctx->mouseX, ctx->mouseY };
+                HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                if (hMonitor) {
+                    MONITORINFO monitorInfo;
+                    monitorInfo.cbSize = sizeof(MONITORINFO);
+                    if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+                        screenRect = monitorInfo.rcMonitor;
+                        ww = screenRect.right - screenRect.left;
+                        wh = screenRect.bottom - screenRect.top;
+                    }
+                }
             }
+
+            curLabelRect = DrawSizeLabel(backDC, ww, wh,
+                screenRect.left - ctx->virtualX, screenRect.top - ctx->virtualY,
+                screenRect.right - ctx->virtualX, screenRect.bottom - ctx->virtualY,
+                ctx->virtualW, ctx->virtualH, ctx->gdi);
         }
 
         // 绘制放大镜信息面板
@@ -1528,7 +1619,24 @@ static LRESULT CALLBACK ScreenshotOverlayWndProc(HWND hwnd, UINT msg, WPARAM wPa
                 if (idx >= 0) {
                     finalRect = ctx->windows[idx].rect;
                 } else {
-                    finalRect = { ctx->mouseX, ctx->mouseY, ctx->mouseX + 1, ctx->mouseY + 1 };
+                    // 匹配不到窗口时，默认选区为鼠标所在的屏幕
+                    POINT pt = { ctx->mouseX, ctx->mouseY };
+                    HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                    if (hMonitor) {
+                        MONITORINFO monitorInfo;
+                        monitorInfo.cbSize = sizeof(MONITORINFO);
+                        if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+                            finalRect = monitorInfo.rcMonitor;
+                        } else {
+                            // 获取失败，降级为虚拟屏幕
+                            finalRect = { ctx->virtualX, ctx->virtualY,
+                                          ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH };
+                        }
+                    } else {
+                        // 获取显示器失败，降级为虚拟屏幕
+                        finalRect = { ctx->virtualX, ctx->virtualY,
+                                      ctx->virtualX + ctx->virtualW, ctx->virtualY + ctx->virtualH };
+                    }
                 }
             } else {
                 finalRect.left = (std::min)(ctx->startX, ctx->endX);
