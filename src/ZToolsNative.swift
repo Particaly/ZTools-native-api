@@ -780,6 +780,521 @@ public func stopMouseMonitor() {
     print("Mouse monitor stopped")
 }
 
+// MARK: - Color Picker
+
+public typealias ColorPickerCallback = @convention(c) (UnsafePointer<CChar>?) -> Void
+
+// 取色器状态
+private var colorPickerCallback: ColorPickerCallback? = nil
+private var colorPickerWindow: NSWindow? = nil
+private var colorPickerView: ColorPickerGridView? = nil
+private var isColorPickerActive = false
+private var lastColorPickerUpdateTime: TimeInterval = 0
+private let colorPickerUpdateInterval: TimeInterval = 1.0 / 30.0 // 30 FPS
+private var colorPickerEventTap: CFMachPort? = nil
+private var colorPickerRunLoopSource: CFRunLoopSource? = nil
+private var colorPickerRunLoop: CFRunLoop? = nil
+
+// Core Graphics 私有函数（用于从后台线程安全移动窗口）
+// CGSMoveWindow 接受 CGPoint 指针（不是两个 float），直接与 WindowServer 通信，无线程限制
+@_silgen_name("CGSMainConnectionID")
+private func CGSMainConnectionID() -> Int32
+@_silgen_name("CGSMoveWindow")
+private func CGSMoveWindow(_ cid: Int32, _ wid: UInt32, _ point: inout CGPoint) -> Int32
+
+/// 9x9 像素放大网格视图（使用 CALayer 直接绘制，线程安全）
+private class ColorPickerGridView: NSView {
+    var pixelColors: [[NSColor]] = []
+    var centerHexColor: String = "#000000"
+    let gridSize = 9
+    let cellSize: CGFloat = 16
+    let labelHeight: CGFloat = 28
+
+    override var isFlipped: Bool { return true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        let totalGridWidth = CGFloat(gridSize) * cellSize
+
+        // 绘制背景（浅灰色边框效果）
+        context.setFillColor(NSColor(white: 0.85, alpha: 1.0).cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: totalGridWidth, height: totalGridWidth))
+
+        // 绘制 9x9 像素网格
+        for row in 0..<gridSize {
+            for col in 0..<gridSize {
+                let color: NSColor
+                if row < pixelColors.count && col < pixelColors[row].count {
+                    color = pixelColors[row][col]
+                } else {
+                    color = .white
+                }
+
+                let rect = CGRect(
+                    x: CGFloat(col) * cellSize,
+                    y: CGFloat(row) * cellSize,
+                    width: cellSize,
+                    height: cellSize
+                )
+
+                // 填充像素颜色
+                context.setFillColor(color.cgColor)
+                context.fill(rect.insetBy(dx: 0.5, dy: 0.5))
+
+                // 绘制网格线
+                context.setStrokeColor(NSColor(white: 0.75, alpha: 0.5).cgColor)
+                context.setLineWidth(0.5)
+                context.stroke(rect)
+            }
+        }
+
+        // 绘制中心十字准星（双层边框）
+        let centerRect = CGRect(
+            x: 4 * cellSize,
+            y: 4 * cellSize,
+            width: cellSize,
+            height: cellSize
+        )
+        // 外层黑框
+        context.setStrokeColor(NSColor.black.cgColor)
+        context.setLineWidth(1.5)
+        context.stroke(centerRect.insetBy(dx: -0.5, dy: -0.5))
+        // 内层白框
+        context.setStrokeColor(NSColor.white.cgColor)
+        context.setLineWidth(1.0)
+        context.stroke(centerRect.insetBy(dx: 0.5, dy: 0.5))
+
+        // 绘制 HEX 标签区域
+        let labelRect = CGRect(x: 0, y: totalGridWidth, width: totalGridWidth, height: labelHeight)
+        context.setFillColor(NSColor(white: 0.15, alpha: 0.9).cgColor)
+        context.fill(labelRect)
+
+        // 绘制 HEX 文本
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraphStyle
+        ]
+        let textRect = CGRect(x: 0, y: totalGridWidth + 5, width: totalGridWidth, height: labelHeight - 4)
+        (centerHexColor as NSString).draw(in: textRect, withAttributes: attributes)
+    }
+
+    func updatePixels(_ colors: [[NSColor]], hex: String) {
+        self.pixelColors = colors
+        self.centerHexColor = hex
+        self.needsDisplay = true
+    }
+}
+
+/// 创建取色器浮动窗口（必须在有 NSApplication 的线程调用）
+private func createColorPickerWindow() -> NSWindow {
+    let gridSize = 9
+    let cellSize: CGFloat = 16
+    let totalGridWidth = CGFloat(gridSize) * cellSize  // 144
+    let labelHeight: CGFloat = 28
+    let windowWidth = totalGridWidth
+    let windowHeight = totalGridWidth + labelHeight  // 172
+
+    let window = NSWindow(
+        contentRect: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight),
+        styleMask: .borderless,
+        backing: .buffered,
+        defer: false
+    )
+
+    window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+    window.isOpaque = false
+    window.backgroundColor = .clear
+    window.hasShadow = true
+    window.ignoresMouseEvents = true
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    window.isReleasedWhenClosed = false
+
+    let view = ColorPickerGridView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
+    window.contentView = view
+
+    // 圆角
+    view.wantsLayer = true
+    view.layer?.cornerRadius = 6
+    view.layer?.masksToBounds = true
+
+    return window
+}
+
+/// 捕获鼠标周围的 9x9 像素颜色（可在任意线程调用）
+private func capturePixelsAroundCursor() -> (colors: [[NSColor]], centerHex: String) {
+    let gridSize = 9
+    let halfGrid = gridSize / 2  // 4
+
+    // 使用 CGEvent 获取鼠标位置（CG 坐标系：左上角原点）
+    let cgMousePos = CGEvent(source: nil)?.location ?? .zero
+
+    // 截取区域（逻辑坐标，9x9 点）
+    let captureRect = CGRect(
+        x: cgMousePos.x - CGFloat(halfGrid),
+        y: cgMousePos.y - CGFloat(halfGrid),
+        width: CGFloat(gridSize),
+        height: CGFloat(gridSize)
+    )
+
+    // 使用 optionOnScreenBelowWindow 排除取色器自身窗口
+    let windowID: CGWindowID
+    if let win = colorPickerWindow {
+        windowID = CGWindowID(win.windowNumber)
+    } else {
+        windowID = kCGNullWindowID
+    }
+
+    guard let cgImage = CGWindowListCreateImage(
+        captureRect,
+        .optionOnScreenBelowWindow,
+        windowID,
+        [.bestResolution]
+    ) else {
+        return (Array(repeating: Array(repeating: NSColor.white, count: gridSize), count: gridSize), "#000000")
+    }
+
+    let imageWidth = cgImage.width
+    let imageHeight = cgImage.height
+
+    // 创建位图上下文来读取像素
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bytesPerPixel = 4
+    let bytesPerRow = bytesPerPixel * imageWidth
+    var pixelData = [UInt8](repeating: 0, count: imageWidth * imageHeight * bytesPerPixel)
+
+    guard let bitmapContext = CGContext(
+        data: &pixelData,
+        width: imageWidth,
+        height: imageHeight,
+        bitsPerComponent: 8,
+        bytesPerRow: bytesPerRow,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+    ) else {
+        return (Array(repeating: Array(repeating: NSColor.white, count: gridSize), count: gridSize), "#000000")
+    }
+
+    bitmapContext.draw(cgImage, in: CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight))
+
+    var colors: [[NSColor]] = []
+    var centerR: UInt8 = 0, centerG: UInt8 = 0, centerB: UInt8 = 0
+
+    for row in 0..<gridSize {
+        var rowColors: [NSColor] = []
+        for col in 0..<gridSize {
+            // 映射逻辑像素到物理像素
+            let px = min(Int(CGFloat(col) * CGFloat(imageWidth) / CGFloat(gridSize)), imageWidth - 1)
+            let py = min(Int(CGFloat(row) * CGFloat(imageHeight) / CGFloat(gridSize)), imageHeight - 1)
+
+            let offset = (py * imageWidth + px) * bytesPerPixel
+            let r = pixelData[offset]
+            let g = pixelData[offset + 1]
+            let b = pixelData[offset + 2]
+
+            let color = NSColor(
+                red: CGFloat(r) / 255.0,
+                green: CGFloat(g) / 255.0,
+                blue: CGFloat(b) / 255.0,
+                alpha: 1.0
+            )
+            rowColors.append(color)
+
+            if row == halfGrid && col == halfGrid {
+                centerR = r
+                centerG = g
+                centerB = b
+            }
+        }
+        colors.append(rowColors)
+    }
+
+    let hex = String(format: "#%02X%02X%02X", centerR, centerG, centerB)
+    return (colors, hex)
+}
+
+/// 更新取色器位置和像素（从 CGEventTap 后台线程调用）
+/// 窗口位置：CGSMoveWindow 直接与 WindowServer 通信，无 AppKit 线程限制
+/// 视图内容：通过 CALayer 更新，避免从后台线程调用 NSView.display()
+private func updateColorPicker() {
+    guard isColorPickerActive else { return }
+
+    guard let window = colorPickerWindow, let view = colorPickerView else { return }
+
+    // 获取鼠标位置（NS 坐标系：左下角原点）
+    let mouseLocation = NSEvent.mouseLocation
+
+    let windowFrame = window.frame
+    let offsetX: CGFloat = 20
+    let offsetY: CGFloat = 20
+
+    // 默认在鼠标右下方（NS 坐标系）
+    var newOriginX = mouseLocation.x + offsetX
+    var newOriginY = mouseLocation.y - offsetY - windowFrame.height
+
+    // 屏幕边界检测
+    let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens[0]
+    let screenFrame = screen.visibleFrame
+
+    if newOriginX + windowFrame.width > screenFrame.maxX {
+        newOriginX = mouseLocation.x - offsetX - windowFrame.width
+    }
+    if newOriginY < screenFrame.minY {
+        newOriginY = mouseLocation.y + offsetY
+    }
+    if newOriginX < screenFrame.minX {
+        newOriginX = screenFrame.minX
+    }
+
+    // CGSMoveWindow 使用 CG 屏幕坐标系（左上角原点），需要从 NS 坐标系翻转 Y 轴
+    // NS: origin = 窗口左下角, Y 向上
+    // CG: origin = 窗口左上角, Y 向下
+    let mainScreenHeight = NSScreen.screens[0].frame.height
+    var cgsPoint = CGPoint(
+        x: newOriginX,
+        y: mainScreenHeight - newOriginY - windowFrame.height
+    )
+
+    let cid = CGSMainConnectionID()
+    let wid = UInt32(window.windowNumber)
+    _ = CGSMoveWindow(cid, wid, &cgsPoint)
+
+    // 帧率节流：限制截屏频率
+    let now = CACurrentMediaTime()
+    if now - lastColorPickerUpdateTime >= colorPickerUpdateInterval {
+        lastColorPickerUpdateTime = now
+
+        // 截屏并更新像素（CGWindowListCreateImage 是线程安全的）
+        let (colors, hex) = capturePixelsAroundCursor()
+
+        // 通过 CALayer 更新视图内容（Core Animation 事务是线程安全的）
+        // 关键：不能从后台线程调用 NSView.display()，那会导致窗口消失
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        view.pixelColors = colors
+        view.centerHexColor = hex
+        view.layer?.setNeedsDisplay()
+        view.layer?.displayIfNeeded()
+        CATransaction.commit()
+    }
+}
+
+/// CGEventTap 回调（拦截模式）— 在 colorPickerThread 的 RunLoop 中被调用
+private func colorPickerEventTapHandler(_ proxy: CGEventTapProxy, _ type: CGEventType, _ event: CGEvent, _ userInfo: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    guard isColorPickerActive else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // 处理系统禁用事件（tap 超时被系统关闭时重新启用）
+    if type.rawValue == 0xFFFFFFFE || type.rawValue == 0xFFFFFFFF {
+        if let tap = colorPickerEventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    switch type {
+    case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+        // 鼠标移动 → 更新取色器（在当前线程直接更新，该线程拥有 NSApp RunLoop）
+        updateColorPicker()
+        return Unmanaged.passUnretained(event)
+
+    case .leftMouseDown:
+        // 左键点击 → 确认取色
+        let (_, hex) = capturePixelsAroundCursor()
+        let jsonString = "{\"success\":true,\"hex\":\"\(hex)\"}"
+        jsonString.withCString { cStr in
+            colorPickerCallback?(cStr)
+        }
+        stopColorPickerInternal()
+        return nil // 拦截点击事件
+
+    case .keyDown:
+        // ESC 键 → 取消
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        if keyCode == 53 { // ESC
+            let jsonString = "{\"success\":false,\"hex\":null}"
+            jsonString.withCString { cStr in
+                colorPickerCallback?(cStr)
+            }
+            stopColorPickerInternal()
+            return nil // 拦截 ESC
+        }
+        return Unmanaged.passUnretained(event)
+
+    default:
+        return Unmanaged.passUnretained(event)
+    }
+}
+
+/// 启动取色器
+@_cdecl("startColorPicker")
+public func startColorPicker(_ callback: ColorPickerCallback?) {
+    guard let callback = callback else {
+        print("Error: color picker callback is nil")
+        return
+    }
+
+    guard !isColorPickerActive else {
+        print("Warning: Color picker already active")
+        return
+    }
+
+    colorPickerCallback = callback
+    isColorPickerActive = true
+
+    // 确保 NSApplication 完整初始化（N-API 调用在主线程上）
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    app.finishLaunching()
+
+    // 在主线程创建窗口（AppKit 要求 NSWindow 必须在主线程创建）
+    let window = createColorPickerWindow()
+    colorPickerWindow = window
+    colorPickerView = window.contentView as? ColorPickerGridView
+
+    // 初始定位
+    do {
+        let mouseLocation = NSEvent.mouseLocation
+        let windowFrame = window.frame
+        let offsetX: CGFloat = 20
+        let offsetY: CGFloat = 20
+        var newOrigin = NSPoint(
+            x: mouseLocation.x + offsetX,
+            y: mouseLocation.y - offsetY - windowFrame.height
+        )
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens[0]
+        let screenFrame = screen.visibleFrame
+        if newOrigin.x + windowFrame.width > screenFrame.maxX {
+            newOrigin.x = mouseLocation.x - offsetX - windowFrame.width
+        }
+        if newOrigin.y < screenFrame.minY {
+            newOrigin.y = mouseLocation.y + offsetY
+        }
+        if newOrigin.x < screenFrame.minX {
+            newOrigin.x = screenFrame.minX
+        }
+        window.setFrameOrigin(newOrigin)
+
+        let (colors, hex) = capturePixelsAroundCursor()
+        colorPickerView?.updatePixels(colors, hex: hex)
+        colorPickerView?.display()
+    }
+
+    // 显示窗口
+    window.orderFrontRegardless()
+    window.display()
+    NSApp.activate(ignoringOtherApps: true)
+
+    // 手动泵 AppKit 事件循环，确保窗口提交到 WindowServer
+    // Node.js 主线程不运行 NSRunLoop，必须手动处理一次才能让窗口真正显示
+    while let event = NSApp.nextEvent(
+        matching: .any,
+        until: nil,
+        inMode: .default,
+        dequeue: true
+    ) {
+        NSApp.sendEvent(event)
+    }
+
+    print("Color picker window created on main thread")
+
+    // 在后台线程启动 CGEventTap
+    DispatchQueue.global(qos: .userInteractive).async {
+        let eventMask: CGEventMask =
+            (1 << CGEventType.mouseMoved.rawValue) |
+            (1 << CGEventType.leftMouseDragged.rawValue) |
+            (1 << CGEventType.rightMouseDragged.rawValue) |
+            (1 << CGEventType.otherMouseDragged.rawValue) |
+            (1 << CGEventType.leftMouseDown.rawValue) |
+            (1 << CGEventType.keyDown.rawValue)
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: { (proxy, type, event, userInfo) -> Unmanaged<CGEvent>? in
+                return colorPickerEventTapHandler(proxy, type, event, userInfo)
+            },
+            userInfo: nil
+        ) else {
+            print("Error: Failed to create color picker event tap. Check accessibility permissions.")
+            isColorPickerActive = false
+            return
+        }
+
+        colorPickerEventTap = tap
+
+        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            print("Error: Failed to create run loop source for color picker")
+            CFMachPortInvalidate(tap)
+            colorPickerEventTap = nil
+            isColorPickerActive = false
+            return
+        }
+
+        colorPickerRunLoopSource = source
+        colorPickerRunLoop = CFRunLoopGetCurrent()
+        CFRunLoopAddSource(colorPickerRunLoop!, source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        print("Color picker event tap started")
+        CFRunLoopRun()
+        print("Color picker event tap run loop ended")
+    }
+
+    print("Color picker started")
+}
+
+/// 停止取色器
+@_cdecl("stopColorPicker")
+public func stopColorPicker() {
+    stopColorPickerInternal()
+}
+
+/// 内部停止（可从事件 tap 回调线程或主线程调用）
+private func stopColorPickerInternal() {
+    guard isColorPickerActive else { return }
+    isColorPickerActive = false
+
+    // 停止 CGEventTap
+    if let tap = colorPickerEventTap {
+        CGEvent.tapEnable(tap: tap, enable: false)
+    }
+
+    if let source = colorPickerRunLoopSource, let runLoop = colorPickerRunLoop {
+        CFRunLoopRemoveSource(runLoop, source, .commonModes)
+    }
+
+    if let tap = colorPickerEventTap {
+        CFMachPortInvalidate(tap)
+    }
+
+    // 停止 RunLoop
+    if let runLoop = colorPickerRunLoop {
+        CFRunLoopStop(runLoop)
+    }
+
+    colorPickerRunLoopSource = nil
+    colorPickerEventTap = nil
+    colorPickerRunLoop = nil
+
+    // 关闭窗口（需要在主线程操作）
+    // 直接操作也 OK，因为 orderOut 不像 init 那样严格检查线程
+    colorPickerWindow?.orderOut(nil)
+    colorPickerWindow = nil
+    colorPickerView = nil
+    colorPickerCallback = nil
+
+    print("Color picker stopped")
+}
+
 // MARK: - Helper Functions
 
 /// 辅助函数：转义 JSON 字符串

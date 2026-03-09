@@ -19,6 +19,9 @@ typedef int (*SimulateKeyboardTapFunc)(const char *,
 typedef void (*MouseEventCB)(const char *);                       // 鼠标事件回调
 typedef void (*StartMouseMonitorFunc)(const char *, int, MouseEventCB); // 启动鼠标监控
 typedef void (*StopMouseMonitorFunc)();                            // 停止鼠标监控
+typedef void (*ColorPickerCB)(const char *);                       // 取色器回调
+typedef void (*StartColorPickerFunc)(ColorPickerCB);               // 启动取色器
+typedef void (*StopColorPickerFunc)();                             // 停止取色器
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -36,6 +39,9 @@ static SimulateKeyboardTapFunc simulateKeyboardTapFunc =
 static napi_threadsafe_function mouseTsfn = nullptr;
 static StartMouseMonitorFunc startMouseMonitorFunc = nullptr;
 static StopMouseMonitorFunc stopMouseMonitorFunc = nullptr;
+static napi_threadsafe_function colorPickerTsfn = nullptr;
+static StartColorPickerFunc startColorPickerFunc = nullptr;
+static StopColorPickerFunc stopColorPickerFunc = nullptr;
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -251,11 +257,16 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (StartMouseMonitorFunc)dlsym(swiftLibHandle, "startMouseMonitor");
   stopMouseMonitorFunc =
       (StopMouseMonitorFunc)dlsym(swiftLibHandle, "stopMouseMonitor");
+  startColorPickerFunc =
+      (StartColorPickerFunc)dlsym(swiftLibHandle, "startColorPicker");
+  stopColorPickerFunc =
+      (StopColorPickerFunc)dlsym(swiftLibHandle, "stopColorPicker");
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
       !simulatePasteFunc || !simulateKeyboardTapFunc ||
-      !startMouseMonitorFunc || !stopMouseMonitorFunc) {
+      !startMouseMonitorFunc || !stopMouseMonitorFunc ||
+      !startColorPickerFunc || !stopColorPickerFunc) {
     Napi::Error::New(env, "Failed to load Swift functions")
         .ThrowAsJavaScriptException();
     dlclose(swiftLibHandle);
@@ -637,6 +648,103 @@ Napi::Value StopMouseMonitor(const Napi::CallbackInfo &info) {
   return env.Undefined();
 }
 
+// 在主线程调用 JS 回调（取色器结果）
+void CallColorPickerJs(napi_env env, napi_value js_callback, void *context,
+                       void *data) {
+  if (env != nullptr && js_callback != nullptr && data != nullptr) {
+    char *jsonStr = static_cast<char *>(data);
+    Napi::Env napiEnv(env);
+    Napi::Object result = Napi::Object::New(napiEnv);
+
+    std::string jsonString(jsonStr);
+    free(jsonStr);
+
+    // 解析 "success":true/false
+    if (jsonString.find("\"success\":true") != std::string::npos) {
+      result.Set("success", Napi::Boolean::New(napiEnv, true));
+    } else {
+      result.Set("success", Napi::Boolean::New(napiEnv, false));
+    }
+
+    // 解析 "hex":"#XXXXXX"
+    size_t hexPos = jsonString.find("\"hex\":\"");
+    if (hexPos != std::string::npos) {
+      size_t start = hexPos + 7;
+      size_t end = jsonString.find("\"", start);
+      if (end != std::string::npos) {
+        std::string hex = jsonString.substr(start, end - start);
+        result.Set("hex", Napi::String::New(napiEnv, hex));
+      }
+    } else {
+      result.Set("hex", napiEnv.Null());
+    }
+
+    napi_value global;
+    napi_get_global(env, &global);
+    napi_value resultValue = result;
+    napi_call_function(env, global, js_callback, 1, &resultValue, nullptr);
+  }
+}
+
+// Swift 取色器回调 -> 推送到线程安全队列
+void OnColorPicked(const char *jsonStr) {
+  if (colorPickerTsfn != nullptr && jsonStr != nullptr) {
+    char *jsonCopy = strdup(jsonStr);
+    napi_call_threadsafe_function(colorPickerTsfn, jsonCopy,
+                                  napi_tsfn_nonblocking);
+  }
+}
+
+// 启动取色器
+Napi::Value StartColorPicker(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (!LoadSwiftLibrary(env)) {
+    return env.Undefined();
+  }
+
+  if (info.Length() < 1 || !info[0].IsFunction()) {
+    Napi::TypeError::New(env, "Expected a callback function")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  if (colorPickerTsfn != nullptr) {
+    Napi::Error::New(env, "Color picker already active")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  napi_value callback = info[0];
+  napi_value resource_name;
+  napi_create_string_utf8(env, "ColorPickerCallback", NAPI_AUTO_LENGTH,
+                          &resource_name);
+
+  napi_create_threadsafe_function(env, callback, nullptr, resource_name, 0, 1,
+                                  nullptr, nullptr, nullptr, CallColorPickerJs,
+                                  &colorPickerTsfn);
+
+  startColorPickerFunc(OnColorPicked);
+
+  return env.Undefined();
+}
+
+// 停止取色器
+Napi::Value StopColorPicker(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  if (stopColorPickerFunc != nullptr) {
+    stopColorPickerFunc();
+  }
+
+  if (colorPickerTsfn != nullptr) {
+    napi_release_threadsafe_function(colorPickerTsfn, napi_tsfn_release);
+    colorPickerTsfn = nullptr;
+  }
+
+  return env.Undefined();
+}
+
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
@@ -652,6 +760,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startMouseMonitor",
               Napi::Function::New(env, StartMouseMonitor));
   exports.Set("stopMouseMonitor", Napi::Function::New(env, StopMouseMonitor));
+  exports.Set("startColorPicker",
+              Napi::Function::New(env, StartColorPicker));
+  exports.Set("stopColorPicker", Napi::Function::New(env, StopColorPicker));
   return exports;
 }
 

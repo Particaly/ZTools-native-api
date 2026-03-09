@@ -324,6 +324,79 @@ class MouseMonitor {
   }
 }
 
+// 取色器类
+class ColorPicker {
+  static _callback = null;
+  static _isActive = false;
+
+  /**
+   * 启动取色器
+   * 进入取色模式后，鼠标附近会出现 9x9 像素放大网格
+   * 点击鼠标左键确认取色，按 ESC 键取消
+   *
+   * @param {Function} callback - 取色完成时的回调函数
+   * - 成功: { success: true, hex: '#59636E' }
+   * - 取消: { success: false, hex: null }
+   *
+   * @example
+   * ColorPicker.start((result) => {
+   *   if (result.success) {
+   *     console.log('选中的颜色:', result.hex);
+   *   } else {
+   *     console.log('取色已取消');
+   *   }
+   * });
+   */
+  static start(callback) {
+    if (platform !== 'darwin') {
+      throw new Error('ColorPicker is only supported on macOS');
+    }
+
+    if (ColorPicker._isActive) {
+      throw new Error('Color picker is already active');
+    }
+
+    if (typeof callback !== 'function') {
+      throw new TypeError('Callback must be a function');
+    }
+
+    ColorPicker._callback = callback;
+    ColorPicker._isActive = true;
+
+    addon.startColorPicker((result) => {
+      // 清理 TSFN
+      addon.stopColorPicker();
+
+      ColorPicker._isActive = false;
+      if (ColorPicker._callback) {
+        const cb = ColorPicker._callback;
+        ColorPicker._callback = null;
+        cb(result);
+      }
+    });
+  }
+
+  /**
+   * 停止取色器（手动取消）
+   */
+  static stop() {
+    if (!ColorPicker._isActive) {
+      return;
+    }
+
+    addon.stopColorPicker();
+    ColorPicker._isActive = false;
+    ColorPicker._callback = null;
+  }
+
+  /**
+   * 是否正在取色
+   */
+  static get isActive() {
+    return ColorPicker._isActive;
+  }
+}
+
 // 区域截图类
 class ScreenCapture {
   /**
@@ -448,6 +521,7 @@ module.exports = {
   WindowManager,
   ScreenCapture,
   MouseMonitor,
+  ColorPicker,
   IconExtractor,
   UwpManager,
   MuiResolver
