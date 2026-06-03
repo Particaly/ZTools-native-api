@@ -2745,10 +2745,12 @@ std::string GetClipboardTextContent() {
         if (hData != NULL) {
             wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
             if (pszText != NULL) {
-                int utf8Size = WideCharToMultiByte(CP_UTF8, 0, pszText, -1, nullptr, 0, nullptr, nullptr);
+                // 使用 wcslen 获取实际长度，避免越界写入
+                int wideLen = static_cast<int>(wcslen(pszText));
+                int utf8Size = WideCharToMultiByte(CP_UTF8, 0, pszText, wideLen, nullptr, 0, nullptr, nullptr);
                 if (utf8Size > 0) {
-                    result.resize(utf8Size - 1);
-                    WideCharToMultiByte(CP_UTF8, 0, pszText, -1, &result[0], utf8Size, nullptr, nullptr);
+                    result.resize(utf8Size);
+                    WideCharToMultiByte(CP_UTF8, 0, pszText, wideLen, &result[0], utf8Size, nullptr, nullptr);
                 }
                 GlobalUnlock(hData);
             }
@@ -2779,6 +2781,7 @@ std::string GetClipboardImageContent() {
     }
 
     HBITMAP hBitmap = NULL;
+    bool mustDeleteBitmap = false; // 标记是否需要删除 hBitmap
 
     // 尝试获取位图
     if (IsClipboardFormatAvailable(CF_BITMAP)) {
@@ -2793,6 +2796,7 @@ std::string GetClipboardImageContent() {
                 hBitmap = CreateDIBitmap(hDC, &pBMI->bmiHeader, CBM_INIT, pBits, pBMI, DIB_RGB_COLORS);
                 ReleaseDC(NULL, hDC);
                 GlobalUnlock(hDIB);
+                mustDeleteBitmap = true; // 标记需要删除
             }
         }
     }
@@ -2829,9 +2833,8 @@ std::string GetClipboardImageContent() {
             delete bitmap;
         }
 
-        if (IsClipboardFormatAvailable(CF_BITMAP)) {
-            // CF_BITMAP 不需要删除，由系统管理
-        } else {
+        // 根据标记决定是否删除 hBitmap
+        if (mustDeleteBitmap) {
             DeleteObject(hBitmap);
         }
     }
@@ -2858,10 +2861,12 @@ std::vector<std::string> GetClipboardFilesList() {
                     std::wstring wPath(pathLen, L'\0');
                     DragQueryFileW(hDrop, i, &wPath[0], pathLen + 1);
 
-                    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                    // 使用实际长度进行精确转换，避免越界写入
+                    int wideLen = static_cast<int>(wPath.length());
+                    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), wideLen, nullptr, 0, nullptr, nullptr);
                     if (utf8Size > 0) {
-                        std::string utf8Path(utf8Size - 1, '\0');
-                        WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), -1, &utf8Path[0], utf8Size, nullptr, nullptr);
+                        std::string utf8Path(utf8Size, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, wPath.c_str(), wideLen, &utf8Path[0], utf8Size, nullptr, nullptr);
                         result.push_back(utf8Path);
                     }
                 }
@@ -2947,10 +2952,12 @@ std::string TryGetSelectedTextViaUIAutomation() {
                 BSTR bstrText = nullptr;
                 hr = pRange->GetText(-1, &bstrText);
                 if (SUCCEEDED(hr) && bstrText) {
-                    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, bstrText, -1, nullptr, 0, nullptr, nullptr);
+                    // 使用 SysStringLen 获取实际长度，避免越界写入
+                    int wideLen = static_cast<int>(SysStringLen(bstrText));
+                    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, bstrText, wideLen, nullptr, 0, nullptr, nullptr);
                     if (utf8Size > 0) {
-                        std::string utf8Text(utf8Size - 1, 0);
-                        WideCharToMultiByte(CP_UTF8, 0, bstrText, -1, &utf8Text[0], utf8Size, nullptr, nullptr);
+                        std::string utf8Text(utf8Size, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, bstrText, wideLen, &utf8Text[0], utf8Size, nullptr, nullptr);
                         if (!selectedText.empty()) selectedText += "\n";
                         selectedText += utf8Text;
                     }
@@ -3072,7 +3079,11 @@ Napi::Value GetSelectedContent(const Napi::CallbackInfo& info) {
                     if (pData != NULL) {
                         MultiByteToWideChar(CP_UTF8, 0, originalText.c_str(), -1, pData, wideSize);
                         GlobalUnlock(hGlobal);
-                        SetClipboardData(CF_UNICODETEXT, hGlobal);
+                        if (SetClipboardData(CF_UNICODETEXT, hGlobal) == NULL) {
+                            GlobalFree(hGlobal); // 失败时释放内存
+                        }
+                    } else {
+                        GlobalFree(hGlobal); // GlobalLock 失败时释放内存
                     }
                 }
             }
@@ -3098,14 +3109,20 @@ Napi::Value GetSelectedContent(const Napi::CallbackInfo& info) {
                     pDropFiles->fWide = TRUE;
 
                     wchar_t* pData = reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(pDropFiles) + sizeof(DROPFILES));
+                    size_t remainingChars = (totalSize - sizeof(DROPFILES)) / sizeof(wchar_t);
                     for (const auto& file : originalFiles) {
-                        int wideSize = MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, pData, (totalSize - sizeof(DROPFILES)) / sizeof(wchar_t));
+                        int wideSize = MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, pData, static_cast<int>(remainingChars));
                         pData += wideSize;
+                        remainingChars -= wideSize;
                     }
                     *pData = L'\0';
 
                     GlobalUnlock(hGlobal);
-                    SetClipboardData(CF_HDROP, hGlobal);
+                    if (SetClipboardData(CF_HDROP, hGlobal) == NULL) {
+                        GlobalFree(hGlobal); // 失败时释放内存
+                    }
+                } else {
+                    GlobalFree(hGlobal); // GlobalLock 失败时释放内存
                 }
             }
         }

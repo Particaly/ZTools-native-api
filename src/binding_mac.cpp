@@ -382,6 +382,20 @@ Napi::Value ResumeMonitor(const Napi::CallbackInfo &info) {
 
 // ==================== 获取选中内容（Mac 实现）====================
 
+// 注意：以下函数使用 popen 调用外部命令（pbpaste, osascript）来操作剪贴板
+//
+// 性能考虑：
+// - 这些是低频操作（用户主动触发 getSelectedContent 时才调用）
+// - 相比高频的剪贴板监控（已由 Swift 库处理），性能影响可接受
+//
+// 未来优化方向：
+// - 将此文件重命名为 .mm 并使用 Objective-C++ 直接调用 NSPasteboard API
+// - 或在 Swift 库中实现这些功能并通过 FFI 调用
+//
+// 当前实现的优点：
+// - 简单可维护，无需额外的 Objective-C++ 编译配置
+// - 与 Swift 库保持清晰的职责分离
+
 // 获取剪贴板文本内容
 std::string GetPasteboardText() {
   FILE* pipe = popen("pbpaste", "r");
