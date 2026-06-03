@@ -414,6 +414,25 @@ std::string GetPasteboardText() {
 std::vector<std::string> GetPasteboardFiles() {
   std::vector<std::string> result;
 
+  // 先检查剪贴板是否真的包含文件 URL 类型，避免普通文本被 AppleScript 强制转成伪路径。
+  FILE* infoPipe = popen("osascript -e 'clipboard info'", "r");
+  if (!infoPipe) return result;
+
+  bool hasFileUrl = false;
+  char infoBuffer[1024];
+  while (fgets(infoBuffer, sizeof(infoBuffer), infoPipe)) {
+    std::string line = infoBuffer;
+    if (line.find("«class furl»") != std::string::npos) {
+      hasFileUrl = true;
+      break;
+    }
+  }
+  pclose(infoPipe);
+
+  if (!hasFileUrl) {
+    return result;
+  }
+
   // 使用 osascript 获取文件列表
   FILE* pipe = popen("osascript -e 'try' -e 'set theList to (the clipboard as «class furl») as list' -e 'set output to \"\"' -e 'repeat with aFile in theList' -e 'set output to output & POSIX path of aFile & linefeed' -e 'end repeat' -e 'return output' -e 'end try'", "r");
   if (!pipe) return result;
