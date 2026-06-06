@@ -277,19 +277,26 @@ class WindowManager {
     return addon.simulateKeyboardTap(key, ...modifiers);
   }
   /**
-   * 获取所有打开的文件资源管理器窗口的 URL 列表
-   * @returns {Array<string>} file:/// 格式的路径字符串数组
-   * @example
-   * // Windows
-   * const urls = WindowManager.getAllExplorerWindows();
-   * // ['file:///C:/Users/username/Documents', 'file:///D:/Projects']
-   *
-   * // macOS
-   * const urls = WindowManager.getAllExplorerWindows();
-   * // ['file:///Users/username/Documents', 'file:///Volumes/Data/Projects']
+   * 获取所有打开的文件资源管理器/Finder 窗口信息
+   * @returns {Array<{platform?: string, kind?: string, preciseTarget?: boolean, hwnd?: number, windowId?: number, finderId?: number, pid?: number, bundleId?: string, app?: string, title?: string, className?: string, axRole?: string, axSubrole?: string, path?: string, url?: string}>}
    */
   static getAllExplorerWindows() {
     return addon.getAllExplorerWindows();
+  }
+
+  /**
+   * 判断指定窗口是否是可安全修改地址栏的文件定位窗口
+   * @param {number} hwnd - Windows 窗口句柄
+   * @returns {boolean}
+   */
+  static isFileLocationWindow(hwnd) {
+    if (platform !== 'win32') {
+      throw new Error('isFileLocationWindow is only available on Windows');
+    }
+    if (typeof hwnd !== 'number' || !Number.isFinite(hwnd) || hwnd <= 0) {
+      throw new TypeError('hwnd must be a positive number');
+    }
+    return addon.isFileLocationWindow(hwnd);
   }
 
   /**
@@ -311,7 +318,7 @@ class WindowManager {
       if (platform === 'win32') {
         identifier = target.hwnd;
       } else if (platform === 'darwin') {
-        identifier = target.bundleId || target.pid;
+        identifier = target;
       }
     }
 

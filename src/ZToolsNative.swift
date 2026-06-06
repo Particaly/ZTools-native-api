@@ -18,6 +18,7 @@ private var windowMonitorQueue: DispatchQueue?
 private var isWindowMonitoring = false
 private var lastBundleId: String = ""
 private var lastProcessId: pid_t = 0
+private var lastWindowId: Int = 0
 private let fileIconSize = NSSize(width: 80, height: 80)
 
 // MARK: - File Icon
@@ -148,6 +149,124 @@ public func stopClipboardMonitor() {
 
 // MARK: - Window Management
 
+private struct WindowMetadata {
+    var pid: pid_t
+    var bundleId: String
+    var appName: String
+    var title: String
+    var app: String
+    var appPath: String
+    var bounds: CGRect
+    var windowId: Int
+    var finderId: Int?
+    var path: String?
+    var url: String?
+    var axRole: String
+    var axSubrole: String
+    var kind: String?
+    var preciseTarget: Bool
+}
+
+private func focusedAXWindow(for pid: pid_t) -> AXUIElement? {
+    let app = AXUIElementCreateApplication(pid)
+    var windowValue: AnyObject?
+    let result = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowValue)
+    if result == .success, let window = windowValue {
+        return (window as! AXUIElement)
+    }
+    return nil
+}
+
+private func axStringAttribute(_ window: AXUIElement, _ attribute: CFString) -> String {
+    var value: AnyObject?
+    AXUIElementCopyAttributeValue(window, attribute, &value)
+    if let stringValue = value as? String {
+        return stringValue
+    }
+    if let urlValue = value as? URL {
+        return urlValue.absoluteString
+    }
+    return ""
+}
+
+private func axBounds(_ window: AXUIElement) -> CGRect {
+    var positionValue: AnyObject?
+    var sizeValue: AnyObject?
+    AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue)
+    AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue)
+
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    if let posValue = positionValue {
+        AXValueGetValue(posValue as! AXValue, .cgPoint, &position)
+    }
+    if let szValue = sizeValue {
+        AXValueGetValue(szValue as! AXValue, .cgSize, &size)
+    }
+    return CGRect(origin: position, size: size)
+}
+
+private func normalizedFileLocation(from rawValue: String) -> (path: String?, url: String?) {
+    guard !rawValue.isEmpty else { return (nil, nil) }
+    if rawValue.hasPrefix("file://"), let fileURL = URL(string: rawValue) {
+        return (fileURL.path, fileURL.absoluteString)
+    }
+    if rawValue.hasPrefix("/") {
+        let fileURL = URL(fileURLWithPath: rawValue)
+        return (rawValue, fileURL.absoluteString)
+    }
+    return (nil, rawValue)
+}
+
+private func frontFinderWindowInfo() -> (finderId: Int?, path: String?, url: String?) {
+    let script = """
+    tell application "Finder"
+        if (count of Finder windows) is 0 then return ""
+        set w to front Finder window
+        set targetPath to POSIX path of (target of w as alias)
+        return ((id of w) as text) & tab & targetPath
+    end tell
+    """
+
+    var error: NSDictionary?
+    guard let scriptObject = NSAppleScript(source: script) else {
+        return (nil, nil, nil)
+    }
+    let output = scriptObject.executeAndReturnError(&error)
+    if error != nil, output.stringValue == nil {
+        return (nil, nil, nil)
+    }
+    let parts = (output.stringValue ?? "").components(separatedBy: "\t")
+    guard parts.count >= 2, let finderId = Int(parts[0]) else {
+        return (nil, nil, nil)
+    }
+    let path = parts[1]
+    return (finderId, path, URL(fileURLWithPath: path).absoluteString)
+}
+
+private func jsonForWindowMetadata(_ info: WindowMetadata) -> String {
+    var fields: [String] = []
+    fields.append("\"appName\":\"\(escapeJSON(info.appName))\"")
+    fields.append("\"bundleId\":\"\(escapeJSON(info.bundleId))\"")
+    fields.append("\"title\":\"\(escapeJSON(info.title))\"")
+    fields.append("\"app\":\"\(escapeJSON(info.app))\"")
+    fields.append("\"x\":\(Int(info.bounds.origin.x))")
+    fields.append("\"y\":\(Int(info.bounds.origin.y))")
+    fields.append("\"width\":\(Int(info.bounds.size.width))")
+    fields.append("\"height\":\(Int(info.bounds.size.height))")
+    fields.append("\"appPath\":\"\(escapeJSON(info.appPath))\"")
+    fields.append("\"pid\":\(info.pid)")
+    fields.append("\"windowId\":\(info.windowId)")
+    fields.append("\"axRole\":\"\(escapeJSON(info.axRole))\"")
+    fields.append("\"axSubrole\":\"\(escapeJSON(info.axSubrole))\"")
+    fields.append("\"preciseTarget\":\(info.preciseTarget ? "true" : "false")")
+    if let finderId = info.finderId { fields.append("\"finderId\":\(finderId)") }
+    if let path = info.path { fields.append("\"path\":\"\(escapeJSON(path))\"") }
+    if let url = info.url { fields.append("\"url\":\"\(escapeJSON(url))\"") }
+    if let kind = info.kind { fields.append("\"kind\":\"\(escapeJSON(kind))\"") }
+    return "{\(fields.joined(separator: ","))}"
+}
+
 /// 获取窗口标题（使用 Accessibility API）
 private func getWindowTitle(for pid: pid_t) -> String {
     let app = AXUIElementCreateApplication(pid)
@@ -223,28 +342,14 @@ private func getAppName(from app: NSRunningApplication) -> String {
 }
 
 /// 获取当前激活窗口的信息（JSON 格式）
-/// - Returns: JSON 字符串包含 appName、bundleId、title、app、x、y、width、height、appPath 和 pid，需要调用者 free
+/// - Returns: JSON 字符串包含窗口级元数据，需要调用者 free
 @_cdecl("getActiveWindow")
 public func getActiveWindow() -> UnsafeMutablePointer<CChar>? {
-    // 获取当前激活的应用
-    guard let frontmostApp = NSWorkspace.shared.frontmostApplication else {
+    guard let metadata = getFrontmostAppUsingCG() else {
         return strdup("{\"error\":\"No frontmost application\"}")
     }
 
-    let appName = frontmostApp.localizedName ?? "Unknown"
-    let bundleId = frontmostApp.bundleIdentifier ?? "unknown.bundle.id"
-    let pid = frontmostApp.processIdentifier
-    let windowTitle = getWindowTitle(for: pid)
-    let app = getAppName(from: frontmostApp)
-    let appPath = frontmostApp.bundleURL?.path ?? ""
-    let bounds = getWindowBounds(for: pid)
-
-    // 构建 JSON 字符串
-    let jsonString = """
-    {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(bundleId))","title":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(pid)}
-    """
-
-    return strdup(jsonString)
+    return strdup(jsonForWindowMetadata(metadata))
 }
 
 /// 根据 bundleId 激活应用窗口
@@ -270,38 +375,76 @@ public func activateWindow(_ bundleId: UnsafePointer<CChar>?) -> Int32 {
 
 // MARK: - Window Monitor
 
-/// 使用 Core Graphics API 获取当前激活的应用（最可靠）
-private func getFrontmostAppUsingCG() -> (pid: pid_t, bundleId: String, appName: String, windowTitle: String, app: String, appPath: String, bounds: CGRect)? {
-    // 获取所有窗口列表，按层级排序
+/// 使用 Core Graphics API 获取当前激活的窗口
+private func getFrontmostAppUsingCG() -> WindowMetadata? {
     let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
     guard let windowList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return nil
     }
 
-    // 找到最前面的窗口（layer 最小）
     for window in windowList {
-        // 跳过没有 owner PID 的窗口
         guard let pid = window[kCGWindowOwnerPID as String] as? pid_t,
               pid > 0 else {
             continue
         }
 
-        // 跳过窗口层级为 0 的（通常是系统 UI）
-        if let layer = window[kCGWindowLayer as String] as? Int, layer == 0 {
-            // 获取该窗口所属的应用信息
-            if let runningApp = NSRunningApplication(processIdentifier: pid) {
-                // 只返回有UI的普通应用
-                if runningApp.activationPolicy == .regular {
-                    let bundleId = runningApp.bundleIdentifier ?? "unknown.bundle.id"
-                    let appName = runningApp.localizedName ?? "Unknown"
-                    let windowTitle = getWindowTitle(for: pid)
-                    let app = getAppName(from: runningApp)
-                    let appPath = runningApp.bundleURL?.path ?? ""
-                    let bounds = getWindowBounds(for: pid)
-                    return (pid: pid, bundleId: bundleId, appName: appName, windowTitle: windowTitle, app: app, appPath: appPath, bounds: bounds)
-                }
-            }
+        guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0 else {
+            continue
         }
+
+        guard let runningApp = NSRunningApplication(processIdentifier: pid),
+              runningApp.activationPolicy == .regular else {
+            continue
+        }
+
+        let bundleId = runningApp.bundleIdentifier ?? "unknown.bundle.id"
+        let appName = runningApp.localizedName ?? "Unknown"
+        let app = getAppName(from: runningApp)
+        let appPath = runningApp.bundleURL?.path ?? ""
+        let windowId = window[kCGWindowNumber as String] as? Int ?? 0
+        let focusedWindow = focusedAXWindow(for: pid)
+        let title = focusedWindow.map { axStringAttribute($0, kAXTitleAttribute as CFString) } ?? (window[kCGWindowName as String] as? String ?? "")
+        let bounds = focusedWindow.map { axBounds($0) } ?? getWindowBounds(for: pid)
+        let axRole = focusedWindow.map { axStringAttribute($0, kAXRoleAttribute as CFString) } ?? ""
+        let axSubrole = focusedWindow.map { axStringAttribute($0, kAXSubroleAttribute as CFString) } ?? ""
+        let axUrl = focusedWindow.map { axStringAttribute($0, kAXURLAttribute as CFString) } ?? ""
+        let axDocument = focusedWindow.map { axStringAttribute($0, kAXDocumentAttribute as CFString) } ?? ""
+        var location = normalizedFileLocation(from: !axUrl.isEmpty ? axUrl : axDocument)
+        var finderId: Int?
+        var kind: String?
+        var preciseTarget = false
+
+        if bundleId == "com.apple.finder" {
+            let finderInfo = frontFinderWindowInfo()
+            finderId = finderInfo.finderId
+            if let finderPath = finderInfo.path {
+                location.path = finderPath
+                location.url = finderInfo.url
+            }
+            kind = "mac-finder"
+            preciseTarget = finderId != nil
+        } else if axRole == kAXDialogRole as String || axSubrole == kAXSystemDialogSubrole as String || axSubrole == "AXSheet" {
+            kind = "mac-file-dialog"
+            preciseTarget = windowId > 0
+        }
+
+        return WindowMetadata(
+            pid: pid,
+            bundleId: bundleId,
+            appName: appName,
+            title: title,
+            app: app,
+            appPath: appPath,
+            bounds: bounds,
+            windowId: windowId,
+            finderId: finderId,
+            path: location.path,
+            url: location.url,
+            axRole: axRole,
+            axSubrole: axSubrole,
+            kind: kind,
+            preciseTarget: preciseTarget
+        )
     }
 
     return nil
@@ -328,11 +471,9 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
     if let appInfo = getFrontmostAppUsingCG() {
         lastProcessId = appInfo.pid
         lastBundleId = appInfo.bundleId
+        lastWindowId = appInfo.windowId
 
-        // 立即回调初始窗口状态
-        let jsonString = """
-        {"appName":"\(escapeJSON(appInfo.appName))","bundleId":"\(escapeJSON(appInfo.bundleId))","title":"\(escapeJSON(appInfo.windowTitle))","app":"\(escapeJSON(appInfo.app))","x":\(Int(appInfo.bounds.origin.x)),"y":\(Int(appInfo.bounds.origin.y)),"width":\(Int(appInfo.bounds.size.width)),"height":\(Int(appInfo.bounds.size.height)),"appPath":"\(escapeJSON(appInfo.appPath))","pid":\(appInfo.pid)}
-        """
+        let jsonString = jsonForWindowMetadata(appInfo)
         jsonString.withCString { cString in
             callback(cString)
         }
@@ -353,24 +494,14 @@ public func startWindowMonitor(_ callback: WindowCallback?) {
             }
 
             let currentPid = appInfo.pid
-            let currentBundleId = appInfo.bundleId
-            let appName = appInfo.appName
-            let windowTitle = appInfo.windowTitle
-            let app = appInfo.app
-            let appPath = appInfo.appPath
-            let bounds = appInfo.bounds
+            let currentWindowId = appInfo.windowId
 
-            // 检测到窗口切换（使用 PID 比较更可靠）
-            if currentPid != lastProcessId {
+            if currentPid != lastProcessId || currentWindowId != lastWindowId {
                 lastProcessId = currentPid
-                lastBundleId = currentBundleId
+                lastBundleId = appInfo.bundleId
+                lastWindowId = currentWindowId
 
-                // 构建JSON字符串
-                let jsonString = """
-                {"appName":"\(escapeJSON(appName))","bundleId":"\(escapeJSON(currentBundleId))","title":"\(escapeJSON(windowTitle))","app":"\(escapeJSON(app))","x":\(Int(bounds.origin.x)),"y":\(Int(bounds.origin.y)),"width":\(Int(bounds.size.width)),"height":\(Int(bounds.size.height)),"appPath":"\(escapeJSON(appPath))","pid":\(currentPid)}
-                """
-
-                // 调用回调
+                let jsonString = jsonForWindowMetadata(appInfo)
                 jsonString.withCString { cString in
                     callback(cString)
                 }
@@ -390,6 +521,7 @@ public func stopWindowMonitor() {
     windowMonitorQueue = nil
     lastBundleId = ""
     lastProcessId = 0
+    lastWindowId = 0
 
     // 清理观察者（如果有的话）
     if let observer = windowMonitorObserver {
@@ -1610,23 +1742,21 @@ public func simulateMouseRightClick(_ x: Double, _ y: Double) -> Int32 {
 
 // MARK: - Finder Windows
 
-/// 获取所有打开的 Finder 窗口的 file URL 列表
-///
-/// 通过 AppleScript 读取 Finder 窗口目标路径，再使用 URL(fileURLWithPath:)
-/// 统一转换为标准 file:/// URL，确保空格、中文和特殊字符被正确编码。
-/// - Returns: JSON 字符串数组，格式为 ["file:///path1", "file:///path2"]；失败或无窗口时返回 []
+/// 获取所有打开的 Finder 窗口的结构化信息
 @_cdecl("getAllFinderWindows")
 public func getAllFinderWindows() -> UnsafeMutablePointer<CChar>? {
     let script = """
     tell application "Finder"
-        set windowPaths to {}
+        set windowItems to {}
         repeat with w in (get every Finder window)
             try
                 set targetPath to POSIX path of (target of w as alias)
-                set end of windowPaths to targetPath
+                set windowTitle to name of w
+                set windowId to id of w
+                set end of windowItems to ((windowId as text) & tab & windowTitle & tab & targetPath)
             end try
         end repeat
-        return windowPaths
+        return windowItems
     end tell
     """
 
@@ -1642,24 +1772,31 @@ public func getAllFinderWindows() -> UnsafeMutablePointer<CChar>? {
         return strdup("[]")
     }
 
-    // 解析 AppleScript 返回的列表
-    var paths: [String] = []
+    var jsonItems: [String] = []
     if output.numberOfItems > 0 {
         for i in 1...output.numberOfItems {
-            if let item = output.atIndex(i), let path = item.stringValue {
-                paths.append(path)
-            }
+            guard let item = output.atIndex(i), let raw = item.stringValue else { continue }
+            let parts = raw.components(separatedBy: "\t")
+            guard parts.count >= 3, let finderId = Int(parts[0]) else { continue }
+            let title = parts[1]
+            let path = parts[2]
+            let fileURL = URL(fileURLWithPath: path).absoluteString
+            let object = "{" + [
+                "\"platform\":\"darwin\"",
+                "\"kind\":\"mac-finder\"",
+                "\"preciseTarget\":true",
+                "\"bundleId\":\"com.apple.finder\"",
+                "\"app\":\"Finder.app\"",
+                "\"finderId\":\(finderId)",
+                "\"title\":\"\(escapeJSON(title))\"",
+                "\"path\":\"\(escapeJSON(path))\"",
+                "\"url\":\"\(escapeJSON(fileURL))\""
+            ].joined(separator: ",") + "}"
+            jsonItems.append(object)
         }
     }
 
-    // 将 POSIX 路径数组转换为标准 file URL JSON 字符串数组
-    let jsonPaths = paths.map { path -> String in
-        let fileURL = URL(fileURLWithPath: path).absoluteString
-        return "\"\(escapeJSON(fileURL))\""
-    }.joined(separator: ",")
-    let jsonString = "[\(jsonPaths)]"
-
-    return strdup(jsonString)
+    return strdup("[\(jsonItems.joined(separator: ","))]")
 }
 
 // MARK: - Set Address Bar
@@ -1682,6 +1819,10 @@ public func setAddressBar(_ target: UnsafePointer<CChar>?, _ address: UnsafePoin
         return 0
     }
 
+    if targetString.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") {
+        return setAddressBarWithStructuredTarget(targetString, addressString)
+    }
+
     if targetString == "com.apple.finder" {
         return setFinderLocation(addressString)
     }
@@ -1699,6 +1840,47 @@ public func setAddressBar(_ target: UnsafePointer<CChar>?, _ address: UnsafePoin
     }
 
     return setFileDialogLocation(app: app, address: addressString)
+}
+
+private func intTargetField(_ value: Any?) -> Int? {
+    if let number = value as? NSNumber {
+        return number.intValue
+    }
+    if let string = value as? String {
+        return Int(string)
+    }
+    return nil
+}
+
+private func stringTargetField(_ value: Any?) -> String? {
+    if let string = value as? String, !string.isEmpty {
+        return string
+    }
+    return nil
+}
+
+private func setAddressBarWithStructuredTarget(_ targetJson: String, _ address: String) -> Int32 {
+    guard let data = targetJson.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return 0
+    }
+
+    let kind = stringTargetField(object["kind"])
+    if kind == "mac-finder" || intTargetField(object["finderId"]) != nil {
+        guard let finderId = intTargetField(object["finderId"]) else { return 0 }
+        return setFinderLocation(address, finderId: finderId)
+    }
+
+    if kind == "mac-file-dialog" {
+        guard let pidValue = intTargetField(object["pid"]),
+              let app = NSRunningApplication(processIdentifier: pid_t(pidValue)),
+              isFocusedFileDialog(of: app.processIdentifier) else {
+            return 0
+        }
+        return setFileDialogLocation(app: app, address: address)
+    }
+
+    return 0
 }
 
 /// 根据 bundleId 或 pid 字符串查找正在运行的应用。
@@ -1746,8 +1928,7 @@ private func isFocusedFileDialog(of pid: pid_t) -> Bool {
 /// 设置 Finder 前台窗口位置。
 /// - Parameter path: POSIX 路径或 file:// URL
 /// - Returns: 1 成功，0 失败
-private func setFinderLocation(_ path: String) -> Int32 {
-    // 转换为 POSIX 路径（如果是 file:// URL）
+private func setFinderLocation(_ path: String, finderId: Int? = nil) -> Int32 {
     var targetPath = path
     if path.hasPrefix("file://") {
         if let url = URL(string: path) {
@@ -1756,10 +1937,16 @@ private func setFinderLocation(_ path: String) -> Int32 {
     }
 
     let escapedPath = escapeAppleScriptString(targetPath)
+    let targetLine: String
+    if let finderId = finderId {
+        targetLine = "set target of Finder window id \(finderId) to (POSIX file \"\(escapedPath)\")"
+    } else {
+        targetLine = "set target of front Finder window to (POSIX file \"\(escapedPath)\")"
+    }
     let script = """
     tell application "Finder"
         if (count of Finder windows) > 0 then
-            set target of front Finder window to (POSIX file "\(escapedPath)")
+            \(targetLine)
             return true
         else
             return false

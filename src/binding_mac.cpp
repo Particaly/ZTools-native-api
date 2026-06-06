@@ -106,90 +106,25 @@ int parseJsonNumber(const std::string &jsonString, const std::string &key) {
   return 0;
 }
 
+Napi::Value ParseJsonValue(Napi::Env env, const std::string &jsonString) {
+  Napi::Object json = env.Global().Get("JSON").As<Napi::Object>();
+  Napi::Function parse = json.Get("parse").As<Napi::Function>();
+  return parse.Call(json, {Napi::String::New(env, jsonString)});
+}
+
 // 在主线程调用 JS 回调（窗口监控，带JSON参数）
 void CallWindowJs(napi_env env, napi_value js_callback, void *context,
                   void *data) {
   if (env != nullptr && js_callback != nullptr && data != nullptr) {
     char *jsonStr = static_cast<char *>(data);
-
-    // 解析JSON字符串为对象
     Napi::Env napiEnv(env);
-    Napi::Object result = Napi::Object::New(napiEnv);
-
     std::string jsonString(jsonStr);
     free(jsonStr);
 
-    // 查找 "appName":"xxx"
-    size_t appNamePos = jsonString.find("\"appName\":\"");
-    if (appNamePos != std::string::npos) {
-      size_t start = appNamePos + 11;
-      size_t end = jsonString.find("\"", start);
-      if (end != std::string::npos) {
-        std::string appName = jsonString.substr(start, end - start);
-        result.Set("appName", Napi::String::New(napiEnv, appName));
-      }
-    }
-
-    // 查找 "bundleId":"xxx"
-    size_t bundleIdPos = jsonString.find("\"bundleId\":\"");
-    if (bundleIdPos != std::string::npos) {
-      size_t start = bundleIdPos + 12;
-      size_t end = jsonString.find("\"", start);
-      if (end != std::string::npos) {
-        std::string bundleId = jsonString.substr(start, end - start);
-        result.Set("bundleId", Napi::String::New(napiEnv, bundleId));
-      }
-    }
-
-    // 查找 "title":"xxx"
-    size_t titlePos = jsonString.find("\"title\":\"");
-    if (titlePos != std::string::npos) {
-      size_t start = titlePos + 9;
-      size_t end = jsonString.find("\"", start);
-      if (end != std::string::npos) {
-        std::string title = jsonString.substr(start, end - start);
-        result.Set("title", Napi::String::New(napiEnv, title));
-      }
-    }
-
-    // 查找 "app":"xxx"
-    size_t appPos = jsonString.find("\"app\":\"");
-    if (appPos != std::string::npos) {
-      size_t start = appPos + 7;
-      size_t end = jsonString.find("\"", start);
-      if (end != std::string::npos) {
-        std::string app = jsonString.substr(start, end - start);
-        result.Set("app", Napi::String::New(napiEnv, app));
-      }
-    }
-
-    // 解析数字字段
-    result.Set("x",
-               Napi::Number::New(napiEnv, parseJsonNumber(jsonString, "x")));
-    result.Set("y",
-               Napi::Number::New(napiEnv, parseJsonNumber(jsonString, "y")));
-    result.Set("width", Napi::Number::New(
-                            napiEnv, parseJsonNumber(jsonString, "width")));
-    result.Set("height", Napi::Number::New(
-                             napiEnv, parseJsonNumber(jsonString, "height")));
-    result.Set("pid",
-               Napi::Number::New(napiEnv, parseJsonNumber(jsonString, "pid")));
-
-    // 查找 "appPath":"xxx"
-    size_t appPathPos = jsonString.find("\"appPath\":\"");
-    if (appPathPos != std::string::npos) {
-      size_t start = appPathPos + 11;
-      size_t end = jsonString.find("\"", start);
-      if (end != std::string::npos) {
-        std::string appPath = jsonString.substr(start, end - start);
-        result.Set("appPath", Napi::String::New(napiEnv, appPath));
-      }
-    }
-
-    // 调用回调
     napi_value global;
     napi_get_global(env, &global);
-    napi_value resultValue = result;
+    Napi::Value parsed = ParseJsonValue(napiEnv, jsonString);
+    napi_value resultValue = parsed;
     napi_call_function(env, global, js_callback, 1, &resultValue, nullptr);
   }
 }
@@ -651,89 +586,9 @@ Napi::Value GetActiveWindow(const Napi::CallbackInfo &info) {
     return env.Null();
   }
 
-  // 解析 JSON 字符串
   std::string jsonString(jsonStr);
   free(jsonStr);
-
-  // 手动解析简单的 JSON（避免引入额外依赖）
-  Napi::Object result = Napi::Object::New(env);
-
-  // 查找 "appName":"xxx"
-  size_t appNamePos = jsonString.find("\"appName\":\"");
-  if (appNamePos != std::string::npos) {
-    size_t start = appNamePos + 11; // 跳过 "appName":"
-    size_t end = jsonString.find("\"", start);
-    if (end != std::string::npos) {
-      std::string appName = jsonString.substr(start, end - start);
-      result.Set("appName", Napi::String::New(env, appName));
-    }
-  }
-
-  // 查找 "bundleId":"xxx"
-  size_t bundleIdPos = jsonString.find("\"bundleId\":\"");
-  if (bundleIdPos != std::string::npos) {
-    size_t start = bundleIdPos + 12; // 跳过 "bundleId":"
-    size_t end = jsonString.find("\"", start);
-    if (end != std::string::npos) {
-      std::string bundleId = jsonString.substr(start, end - start);
-      result.Set("bundleId", Napi::String::New(env, bundleId));
-    }
-  }
-
-  // 查找 "title":"xxx"
-  size_t titlePos = jsonString.find("\"title\":\"");
-  if (titlePos != std::string::npos) {
-    size_t start = titlePos + 9; // 跳过 "title":"
-    size_t end = jsonString.find("\"", start);
-    if (end != std::string::npos) {
-      std::string title = jsonString.substr(start, end - start);
-      result.Set("title", Napi::String::New(env, title));
-    }
-  }
-
-  // 查找 "app":"xxx"
-  size_t appPos = jsonString.find("\"app\":\"");
-  if (appPos != std::string::npos) {
-    size_t start = appPos + 7; // 跳过 "app":"
-    size_t end = jsonString.find("\"", start);
-    if (end != std::string::npos) {
-      std::string app = jsonString.substr(start, end - start);
-      result.Set("app", Napi::String::New(env, app));
-    }
-  }
-
-  // 解析数字字段
-  result.Set("x", Napi::Number::New(env, parseJsonNumber(jsonString, "x")));
-  result.Set("y", Napi::Number::New(env, parseJsonNumber(jsonString, "y")));
-  result.Set("width",
-             Napi::Number::New(env, parseJsonNumber(jsonString, "width")));
-  result.Set("height",
-             Napi::Number::New(env, parseJsonNumber(jsonString, "height")));
-  result.Set("pid", Napi::Number::New(env, parseJsonNumber(jsonString, "pid")));
-
-  // 查找 "appPath":"xxx"
-  size_t appPathPos = jsonString.find("\"appPath\":\"");
-  if (appPathPos != std::string::npos) {
-    size_t start = appPathPos + 11; // 跳过 "appPath":"
-    size_t end = jsonString.find("\"", start);
-    if (end != std::string::npos) {
-      std::string appPath = jsonString.substr(start, end - start);
-      result.Set("appPath", Napi::String::New(env, appPath));
-    }
-  }
-
-  // 检查是否有错误
-  size_t errorPos = jsonString.find("\"error\":\"");
-  if (errorPos != std::string::npos) {
-    size_t start = errorPos + 9;
-    size_t end = jsonString.find("\"", start);
-    if (end != std::string::npos) {
-      std::string error = jsonString.substr(start, end - start);
-      result.Set("error", Napi::String::New(env, error));
-    }
-  }
-
-  return result;
+  return ParseJsonValue(env, jsonString);
 }
 
 // 激活指定窗口
@@ -1336,12 +1191,7 @@ Napi::Value StopColorPicker(const Napi::CallbackInfo &info) {
 }
 
 /**
- * 获取所有打开的 Finder 窗口的 file URL 列表。
- *
- * Swift 动态库返回 JSON 字符串数组；这里解析成 JS Array<string>。getAllFinderWindows
- * 是可选符号，避免旧版 dylib 缺少该符号时阻断其它 macOS 原生能力加载。
- *
- * @returns Array<string> - file:/// URL 列表；无窗口或调用失败时返回空数组，符号缺失时抛出错误
+ * 获取所有打开的 Finder 窗口的结构化信息。
  */
 Napi::Value GetAllExplorerWindows(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
@@ -1356,84 +1206,14 @@ Napi::Value GetAllExplorerWindows(const Napi::CallbackInfo &info) {
     return env.Undefined();
   }
 
-  // 调用 Swift 函数获取 JSON 字符串
   char *jsonResult = getAllFinderWindowsFunc();
   if (jsonResult == nullptr) {
-    // 返回空数组
     return Napi::Array::New(env, 0);
   }
 
   std::string jsonStr(jsonResult);
   free(jsonResult);
-
-  // 解析 JSON 字符串数组 ["path1", "path2", ...]
-  Napi::Array result = Napi::Array::New(env);
-
-  // 简单的 JSON 数组解析（假设格式良好）
-  if (jsonStr.length() >= 2 && jsonStr[0] == '[' && jsonStr[jsonStr.length() - 1] == ']') {
-    std::string content = jsonStr.substr(1, jsonStr.length() - 2);
-
-    if (!content.empty()) {
-      std::vector<std::string> paths;
-      size_t start = 0;
-      bool inQuote = false;
-      bool escape = false;
-
-      for (size_t i = 0; i < content.length(); i++) {
-        char ch = content[i];
-
-        if (escape) {
-          escape = false;
-          continue;
-        }
-
-        if (ch == '\\') {
-          escape = true;
-          continue;
-        }
-
-        if (ch == '"') {
-          inQuote = !inQuote;
-          if (!inQuote) {
-            // 结束引号
-            std::string path = content.substr(start + 1, i - start - 1);
-            // 反转义
-            std::string unescaped;
-            for (size_t j = 0; j < path.length(); j++) {
-              if (path[j] == '\\' && j + 1 < path.length()) {
-                char next = path[j + 1];
-                if (next == '"' || next == '\\' || next == 'n' || next == 'r' || next == 't') {
-                  if (next == 'n') unescaped += '\n';
-                  else if (next == 'r') unescaped += '\r';
-                  else if (next == 't') unescaped += '\t';
-                  else unescaped += next;
-                  j++;
-                  continue;
-                }
-              }
-              unescaped += path[j];
-            }
-            paths.push_back(unescaped);
-          } else {
-            // 开始引号
-            start = i;
-          }
-        } else if (ch == ',' && !inQuote) {
-          // 逗号分隔符，跳过空白
-          while (i + 1 < content.length() && (content[i + 1] == ' ' || content[i + 1] == '\t')) {
-            i++;
-          }
-        }
-      }
-
-      // 转换为 Napi::Array
-      for (size_t i = 0; i < paths.size(); i++) {
-        result[i] = Napi::String::New(env, paths[i]);
-      }
-    }
-  }
-
-  return result;
+  return ParseJsonValue(env, jsonStr);
 }
 
 /**
@@ -1457,8 +1237,8 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo &info) {
     return Napi::Boolean::New(env, false);
   }
 
-  if (info.Length() < 2 || (!info[0].IsString() && !info[0].IsNumber()) || !info[1].IsString()) {
-    Napi::TypeError::New(env, "target (bundleId or pid) and address (string) are required")
+  if (info.Length() < 2 || (!info[0].IsString() && !info[0].IsNumber() && !info[0].IsObject()) || !info[1].IsString()) {
+    Napi::TypeError::New(env, "target (object, bundleId or pid) and address (string) are required")
         .ThrowAsJavaScriptException();
     return Napi::Boolean::New(env, false);
   }
@@ -1466,8 +1246,12 @@ Napi::Value SetAddressBar(const Napi::CallbackInfo &info) {
   std::string target;
   if (info[0].IsString()) {
     target = info[0].As<Napi::String>().Utf8Value();
-  } else {
+  } else if (info[0].IsNumber()) {
     target = std::to_string(info[0].As<Napi::Number>().Int64Value());
+  } else {
+    Napi::Object json = env.Global().Get("JSON").As<Napi::Object>();
+    Napi::Function stringify = json.Get("stringify").As<Napi::Function>();
+    target = stringify.Call(json, {info[0]}).As<Napi::String>().Utf8Value();
   }
 
   std::string address = info[1].As<Napi::String>().Utf8Value();
