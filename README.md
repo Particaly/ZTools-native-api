@@ -17,6 +17,8 @@ macOS 和 Windows 原生 API 的 Node.js 封装，使用 Swift + Win32 API + Nod
 11. **鼠标模拟** - 模拟鼠标移动、点击操作
 12. **取色器** - 全屏取色工具
 13. **设置文件窗口地址栏** - 跳转 Finder/Explorer 或文件选择对话框到指定路径
+14. **Provider 桥接** - 让原生层（任意 native 线程上的 C++/Swift 代码）调用 JS 侧注册的方法（如宿主应用的翻译 / OCR 提供商）
+15. **截图翻译** - 编辑态工具栏「翻译」按钮：原生编排 OCR（行级坐标）→ 逐行翻译 → 译文覆盖原文字区域（依赖 Provider 桥接，Windows）
 
 ## 🔧 系统要求
 
@@ -341,7 +343,7 @@ WindowManager.simulatePaste();
 **平台差异**：
 - **交互流程一致**：全屏暗化覆盖层 + 拖拽选区/单击智能窗口吸附 → autoConfirm=true 松手直接出图，
   autoConfirm=false 进入编辑态（工具栏 16 按钮、矩形/圆形/箭头/画笔/文字/马赛克标注、撤销/重做、
-  选区圆角手柄）→ 确定/保存/取消/长截图
+  选区圆角手柄）→ 确定/保存/取消/长截图/翻译（翻译仅 Windows，依赖 Provider 桥接，见下文）
 - **macOS**:
   - 需要屏幕录制权限（未授权时首次 `start()` 弹系统授权框，拒绝后回调 `{ success: false, error: ... }`）
   - 另需辅助功能权限：ESC/右键兜底取消（覆盖层失焦时仍可取消）、长截图滚轮观察与自动滚动（CGEventTap）
@@ -427,6 +429,161 @@ contents.forEach((item, index) => {
 - ✅ 支持文件资源管理器/Finder 中选中的文件
 - ✅ 支持图像编辑器中选中的图像区域
 
+### Provider 桥接（原生层调用 JS 方法）
+
+让原生层（任意 native 线程上的 C++/Swift 代码）反向调用 JS 侧注册的方法，并获得异步结果。
+典型场景：宿主应用把 provider 能力（如 `providerManager.invoke('translation' / 'ocr')`）
+交给原生模块，原生业务（截图工具条、事件钩子等）在 native 线程上直接发起调用。
+
+JS 侧注册 handler：
+
+```javascript
+const { ProviderBridge } = require('ztools-native-api');
+
+// 注册后，原生层即可调用这里注册的能力；返回值自动 JSON 序列化回传
+ProviderBridge.start(async (type, input) => {
+  switch (type) {
+    case 'translation':
+      return { text: '你好' };
+    case 'ocr':
+      // 截图翻译依赖行级坐标块，见下文「截图翻译」
+      return { text: '识别到的文字', blocks: [{ text: 'Hello', left: 10, top: 5, right: 90, bottom: 25 }] };
+    default:
+      throw new Error('unknown provider type: ' + type); // 原生侧收到该错误
+  }
+});
+
+// 从 JS 侧验证链路（走真实原生线程路径）：
+const result = await ProviderBridge.invokeFromNative('translation', { text: 'hello' });
+
+// 不再需要时停止（等待中的原生调用会立即收到错误）
+ProviderBridge.stop();
+```
+
+原生侧（C++）调用方式（见 `src/provider_bridge.h`）：
+
+```cpp
+#include "provider_bridge.h"
+
+// 在任意 native 线程上（严禁在 JS 主线程调用，内部会拒绝）：
+ztools_provider_bridge::InvokeResult r =
+    ztools_provider_bridge::Invoke("translation", "{\"text\":\"hello\"}", 5000);
+if (r.ok) {
+  // r.value 为 JS handler 返回值的 JSON 字符串
+}
+```
+
+约束与行为：
+- 原生调用阻塞等待 JS 结果，超时（默认 15s，可指定）返回 `timed out`；迟到的 JS 结果会被丢弃
+- handler 抛错 / reject 会以错误字符串回传原生侧
+- 支持并发调用（按 `seq` 配对请求与结果）；`stop()` 会立即让等待中的调用失败
+- 数据以 JSON 字符串穿越桥接，请保持入参/返回值可 JSON 序列化
+
+### 截图翻译（编辑态工具栏「翻译」按钮，依赖 Provider 桥接）
+
+编辑态（`autoConfirm: false`）工具栏的「翻译」按钮：点击后原生层自动完成
+**OCR 识别选区文字 → 逐行翻译 → 译文覆盖原文字区域**，确认/保存导出的图像同样包含译文覆盖。
+覆盖展示中再次点击「翻译」会清掉旧结果并按当前选区重跑。
+
+编排发生在原生层：先调 type=`ocr` 拿到带行级坐标（top/left/right/bottom）的文本行数组，
+再对每一行分别调 type=`translation`（translation 契约入参为单条 text，多行需逐行请求），
+最后在原生侧把译文与坐标合并、按行高适配字号渲染。OCR/翻译渠道沿用用户在设置页
+选择的默认提供商——宿主只需把桥接类型透传给 providerManager：
+
+```javascript
+ProviderBridge.start(async (type, input) => {
+  // 宿主透传（示意）：OCR/翻译渠道由用户在设置页选择的默认 provider 决定
+  if (type === 'ocr') return providerManager.invoke('ocr', input);
+  if (type === 'translation') return providerManager.invoke('translation', input);
+  throw new Error('unknown provider type: ' + type);
+});
+```
+
+provider 约定（原生侧已按此实现）：
+
+```javascript
+// type = 'ocr'：入参为选区裁剪图（物理像素分辨率）
+//   { image: 'data:image/png;base64,...' }
+// 返回行级文本块，坐标为提交图像内像素坐标（兼容 x/y/width/height 命名）：
+{
+  text: 'Hello World\n第二行',
+  blocks: [
+    { text: 'Hello World', left: 24, top: 33, right: 395, bottom: 66 },
+    { text: '第二行', left: 24, top: 80, right: 260, bottom: 112 },
+  ],
+  confidence: 0.98,
+}
+
+// type = 'translation'：入参单条文本（from/to 缺省用 provider 默认）
+//   { text: 'Hello World' }
+// 返回：
+{ text: '你好，世界' }
+```
+
+- OCR 未返回坐标（blocks 为字符串数组或仅有 text，如纯文本 AI 识别）时走整图兜底：
+  整段文本一次翻译，以整个选区为单一覆盖面板
+- 逐行翻译串行执行；单行失败跳过该行（日志可见），全部失败才整体报错
+
+交互细节：
+- 点击「翻译」→ 选区上方出现「正在识别并翻译…」进度气泡（OCR 超时 30 秒、单行翻译超时 15 秒）
+- 成功 → 每个文字行以白底圆角面板盖住原文并排入译文，字号按行高适配
+  （装不下时自动扩展/缩小字号/省略号截断）
+- 失败（OCR/翻译出错、未识别到文字、超时等）→ 深红文字错误气泡，约 4 秒后自动消失
+- **平台**: ✅ Windows（macOS 编辑态工具栏暂无翻译按钮）
+
+
+## 🗒️ 原生日志（Logger）
+
+原生模块不再「黑盒」：绑定层、截图会话、剪贴板/窗口/鼠标监控、快捷键、翻译（OCR/翻译
+provider 调用）等关键调用、状态变化与失败路径都会写入日志文件，便于用户侧排查问题。
+
+### 日志文件
+
+- 位置：**系统临时目录**下的 `ztools-native.log`
+  - Windows: `%TEMP%\ztools-native.log`（`GetTempPathW`）
+  - macOS: `$TMPDIR/ztools-native.log`（兜底 `/tmp`）
+- 大小限制：**当前文件最大 10MB**；写满时整体轮转为 `ztools-native.log.old`
+  （先删除旧 `.old` 再改名，任何时刻最多两个文件）
+- 每条日志单次写入并立即落盘，原生崩溃时已写内容不丢
+- 格式：`2026-09-22 13:14:39.040 [info] [tid 30828] [core] === ztools_native loaded (pid=40144, win32) ===`
+- 多进程（宿主 + 测试脚本）同时写同一文件时按行追加，偶发交错可接受
+
+### 日志等级
+
+`trace < debug < info < warn < error`（另有 `off` = 完全关闭），默认 `info`。
+两种控制方式：
+
+```bash
+# 方式一：环境变量（进程启动前设置）
+ZTOOLS_LOG_LEVEL=debug node app.js
+```
+
+```javascript
+// 方式二：JS 运行时设置（覆盖环境变量）
+const { Logger } = require('ztools-native-api');
+
+Logger.setLevel('debug');            // 运行时切换等级
+Logger.getLevel();                   // -> 'debug'
+Logger.isLevelEnabled('trace');      // -> true
+Logger.getPath();                    // -> 日志文件绝对路径（可展示给用户）
+Logger.write('info', 'app', '与原生日志同一文件，统一时间线');
+```
+
+埋点覆盖（tag 说明）：
+
+| tag | 内容 |
+|-----|------|
+| `core` | 模块加载（含 pid/平台）、Swift 动态库加载（macOS） |
+| `clipboard` | 监控启停、暂停/恢复、防抖后的剪贴板变化 |
+| `window` | 监控启停、前台切换/激活结果 |
+| `mouse` | 监控启停、长按触发 |
+| `shortcut` | 快捷键监听启停、注册/注销结果、热键触发 |
+| `screenshot` | 会话请求/预抓帧/覆盖层创建/初始化失败/结果输出 |
+| `longcapture` | 长截图开始/中止/完成（帧数与输出尺寸） |
+| `translate` | OCR/翻译请求、provider 调用失败、结果块数 |
+| `provider` | Provider 桥接启停、每次 invoke 的结果/超时 |
+| `uwp` | 包监听启停、install/update/uninstall 事件、应用启动 |
+| `logger` | 通过 JS setLogLevel 的等级变更 |
 
 ## 🧪 测试
 
@@ -437,7 +594,11 @@ npm test
 node test/test-keyboard.js         # 完整键盘测试
 node test/test-keyboard-simple.js  # 简单键盘测试
 node test/test-selected-content.js # 获取选中内容测试
+node test/test-provider-bridge.js  # Provider 桥接（原生层调用 JS 方法）测试
 node test/test-screenshot-mac.js   # macOS 区域截图交互测试（真机手工验收，见脚本头说明）
+node test/test-translate.js        # 截图翻译交互测试（mock provider，真机手工验收，见脚本头说明；
+                                   #   MODE=plain 环境变量切换无坐标兜底模式）
+node test/test-logger.js           # 原生日志（等级/文件/轮转）测试
 ```
 
 ## ⚠️ 平台差异

@@ -4,6 +4,91 @@ const os = require('os');
 const addon = require('./build/Release/ztools_native.node');
 const platform = os.platform();
 
+/**
+ * 原生层日志管理。
+ *
+ * 原生模块（N-API 绑定、截图会话、监控线程等）的关键调用、状态变化与失败路径
+ * 都会写入系统临时目录下的 ztools-native.log（不超过 10MB，写满后整体轮转为
+ * ztools-native.log.old）。通过本类可查询/修改日志等级、获取日志文件路径，
+ * 也可以让 JS 侧把日志写进同一个文件（统一时间线，便于与原生日志对齐排查）。
+ *
+ * 等级：trace < debug < info < warn < error（另有 off = 完全关闭）。
+ * 默认 info；可用环境变量 ZTOOLS_LOG_LEVEL（进程启动前设置）或 setLevel()
+ * （运行时覆盖）控制。
+ */
+class Logger {
+  /**
+   * 支持的日志等级列表
+   * @returns {string[]} ['trace', 'debug', 'info', 'warn', 'error', 'off']
+   */
+  static get levels() {
+    return ['trace', 'debug', 'info', 'warn', 'error', 'off'];
+  }
+
+  /**
+   * 运行时设置日志输出等级（覆盖 ZTOOLS_LOG_LEVEL 环境变量）
+   * @param {string} level - 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'off'
+   * @throws {TypeError} level 不是合法等级字符串时抛出
+   */
+  static setLevel(level) {
+    if (typeof level !== 'string' || !Logger.levels.includes(level.toLowerCase())) {
+      throw new TypeError(`level must be one of: ${Logger.levels.join(', ')}`);
+    }
+    addon.setLogLevel(level.toLowerCase());
+  }
+
+  /**
+   * 查询当前日志输出等级
+   * @returns {string} 当前等级字符串
+   */
+  static getLevel() {
+    return addon.getLogLevel();
+  }
+
+  /**
+   * 查询某等级当前是否会被写入
+   * @param {string} level - 等级字符串
+   * @returns {boolean} 该等级日志当前是否输出
+   */
+  static isLevelEnabled(level) {
+    if (typeof level !== 'string' || !Logger.levels.includes(level.toLowerCase())) {
+      throw new TypeError(`level must be one of: ${Logger.levels.join(', ')}`);
+    }
+    return addon.isLogLevelEnabled(level.toLowerCase());
+  }
+
+  /**
+   * 获取原生日志文件完整路径（系统临时目录下 ztools-native.log）
+   * @returns {string} 日志文件绝对路径
+   * @example
+   * console.log('原生日志:', Logger.getPath());
+   */
+  static getPath() {
+    return addon.getLogFilePath();
+  }
+
+  /**
+   * 向原生日志文件写入一条日志（与原生日志同一文件、同一格式）
+   * @param {string} level - 'trace' | 'debug' | 'info' | 'warn' | 'error'
+   * @param {string} tag - 短模块名（如 'app'）
+   * @param {string} message - 消息内容（不建议包含超大文本/敏感信息）
+   * @example
+   * Logger.write('info', 'app', '截图流程开始');
+   */
+  static write(level, tag, message) {
+    if (typeof level !== 'string' || !Logger.levels.slice(0, 5).includes(level.toLowerCase())) {
+      throw new TypeError(`level must be one of: ${Logger.levels.slice(0, 5).join(', ')}`);
+    }
+    if (typeof tag !== 'string' || !tag) {
+      throw new TypeError('tag must be a non-empty string');
+    }
+    if (typeof message !== 'string') {
+      throw new TypeError('message must be a string');
+    }
+    addon.logWrite(level.toLowerCase(), tag, message);
+  }
+}
+
 class ClipboardMonitor {
   constructor() {
     this._callback = null;
@@ -494,6 +579,9 @@ class ScreenCapture {
    *   拼接无帧数/像素上限，可持续合并至用户主动结束
    * @param {number} [options.longCapture.interval=250] - 滚轮停止后等待内容稳定的毫秒数（50~2000，采样防抖；
    *   滚动进行中也会按不低于 min(interval, 250)ms 的节拍主动采样，保证相邻帧有大重叠区域）
+   * 编辑态工具栏另有「翻译」按钮（仅 Windows）：OCR 识别选区文字 → 翻译 → 译文覆盖原文字区域，
+   * 依赖 ProviderBridge 注册默认启用的 ocr/translation provider（约定见 README「截图翻译」）；
+   * 确认/保存导出的图像同样包含译文覆盖
    * @param {Function} [callback] - 截图完成时的回调函数
    * - 参数: { success: boolean, x?: number, y?: number, x2?: number, y2?: number, width?: number, height?: number, base64?: string, error?: string }
    * - success: 是否成功截图
@@ -729,8 +817,102 @@ function launchCuiShell(shell, currentDirectory) {
   return addon.launchCuiShell(shell, currentDirectory);
 }
 
+/**
+ * Provider 桥接层：让原生层（任意 native 线程上的 C++/Swift 代码）调用 JS 侧注册的方法。
+ *
+ * 典型用法（宿主侧，如 ZTools 主进程把 provider 能力交给原生层）：
+ *   const { ProviderBridge } = require('ztools-native-api');
+ *   ProviderBridge.start(async (type, input) => {
+ *     // type: 'translation' | 'ocr' 等（由宿主与原生侧自行约定）
+ *     // 返回值会以 JSON 序列化后回传给原生线程
+ *     return await providerManager.invoke(type, input);
+ *   });
+ *
+ * 内置约定（Windows 截图工具栏「翻译」按钮依赖以下两个类型，详见 README「截图翻译」）：
+ * - ocr: { image } => { text, blocks: [{ text, left, top, right, bottom }] }
+ *   （blocks 为行级坐标块；provider 只回整段 text 时原生自动走整图兜底）
+ * - translation: { text } => { text }（OCR 多行结果由原生逐行分别调用）
+ *
+ * 原生侧（C++/Swift）调用方式见 src/provider_bridge.h 的
+ * ztools_provider_bridge::Invoke(type, inputJson, timeoutMs)。
+ *
+ * 注意：原生侧的 Invoke 严禁在 JS 主线程上调用（内部检测并直接报错），事件回调
+ * 线程、消息循环线程等 native 线程均可安全调用。
+ */
+const ProviderBridge = {
+  /**
+   * 启动桥接，注册 JS 侧 handler。重复启动会抛错；stop 之后可重新 start。
+   * @param {Function} handler - (type: string, input: any) => Promise<any>；
+   *                              返回值（或 reject 的错误信息）会回传给发起调用的原生线程
+   * @returns {void} 无返回值
+   * @throws {TypeError} handler 不是函数时抛出
+   * @throws {Error} 桥接已启动时抛出
+   */
+  start(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('ProviderBridge.start requires a handler function');
+    }
+    addon.startProviderBridge((type, inputJson, seq) => {
+      Promise.resolve()
+        .then(() => handler(type, JSON.parse(inputJson)))
+        .then((result) => {
+          addon.resolveProviderBridge(seq, JSON.stringify(result === undefined ? null : result));
+        })
+        .catch((err) => {
+          addon.rejectProviderBridge(seq, err instanceof Error ? err.message : String(err));
+        });
+    });
+  },
+
+  /**
+   * 停止桥接并丢弃 handler。已在等待的原生调用会立即收到 "provider bridge stopped" 错误。
+   * @returns {void} 无返回值
+   */
+  stop() {
+    addon.stopProviderBridge();
+  },
+
+  /**
+   * 查询桥接是否就绪。
+   * @returns {boolean} 已 start 且未 stop 时为 true
+   */
+  isReady() {
+    return addon.isProviderBridgeReady();
+  },
+
+  /**
+   * 从 JS 侧发起一次“原生发起”的调用：走真实原生线程 → JS 线程的完整通路，
+   * 用于验证桥接链路（原生业务代码应直接调用 C++ 的 Invoke，而不是本方法）。
+   * @param {string} type - 能力类型
+   * @param {any} input - 入参（自动 JSON 序列化传给 handler）
+   * @param {number} [timeoutMs=15000] - 原生侧等待结果的超时毫秒数
+   * @returns {Promise<any>} handler 的返回值；超时或 handler 抛错时 Promise 被 reject
+   */
+  invokeFromNative(type, input, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      addon.invokeProviderFromNative(
+        type,
+        JSON.stringify(input === undefined ? null : input),
+        timeoutMs,
+        (err, resultJson) => {
+          if (err) {
+            reject(new Error(err));
+            return;
+          }
+          try {
+            resolve(JSON.parse(resultJson));
+          } catch (parseErr) {
+            reject(parseErr);
+          }
+        }
+      );
+    });
+  }
+};
+
 // 导出所有类
 module.exports = {
+  Logger,
   ClipboardMonitor,
   WindowMonitor,
   WindowManager,
@@ -741,6 +923,7 @@ module.exports = {
   UwpManager,
   MuiResolver,
   WindowsShortcutScanner,
+  ProviderBridge,
   getSelectedContent,
   launchCuiShell
 };

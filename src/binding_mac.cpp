@@ -6,6 +6,9 @@
 #include <atomic>
 #include <unistd.h>  // For usleep
 
+#include "provider_bridge.h"
+#include "logger_binding.h"
+
 // Swift 动态库函数类型定义
 typedef void (*ClipboardCallback)();          // 无参数回调
 typedef void (*WindowCallback)(const char *); // 带JSON字符串参数回调
@@ -95,6 +98,7 @@ void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
 // Swift 回调 -> 推送到线程安全队列
 void OnClipboardChanged() {
   if (tsfn != nullptr && !g_isPaused) {
+    ZLOG_DEBUG("clipboard", "changed -> notify JS");
     // 不需要传递数据
     napi_call_threadsafe_function(tsfn, nullptr, napi_tsfn_nonblocking);
   }
@@ -149,6 +153,7 @@ void CallWindowJs(napi_env env, napi_value js_callback, void *context,
 // Swift 窗口回调 -> 推送到线程安全队列
 void OnWindowChanged(const char *jsonStr) {
   if (windowTsfn != nullptr && jsonStr != nullptr) {
+    ZLOG_DEBUG("window", "changed -> notify JS");
     // 复制字符串
     char *jsonCopy = strdup(jsonStr);
     napi_call_threadsafe_function(windowTsfn, jsonCopy, napi_tsfn_nonblocking);
@@ -193,6 +198,7 @@ bool LoadSwiftLibrary(Napi::Env env) {
   for (const auto &path : paths) {
     swiftLibHandle = dlopen(path.c_str(), RTLD_NOW);
     if (swiftLibHandle != nullptr) {
+      ZLOG_INFO("core", "swift library loaded: %s", path.c_str());
       break;
     }
     lastError = dlerror();
@@ -207,6 +213,7 @@ bool LoadSwiftLibrary(Napi::Env env) {
     }
     errorMsg += "Last error: " + lastError;
 
+    ZLOG_ERROR("core", "%s", errorMsg.c_str());
     Napi::Error::New(env, errorMsg).ThrowAsJavaScriptException();
     return false;
   }
@@ -273,6 +280,7 @@ bool LoadSwiftLibrary(Napi::Env env) {
       !setClipboardFilesFunc || !fetchFileIconFunc ||
       !primeScreenshotFrameFunc || !startRegionCaptureFunc ||
       !abortLongCaptureFunc) {
+    ZLOG_ERROR("core", "failed to load Swift function symbols");
     Napi::Error::New(env, "Failed to load Swift functions")
         .ThrowAsJavaScriptException();
     dlclose(swiftLibHandle);
@@ -314,6 +322,7 @@ Napi::Value StartMonitor(const Napi::CallbackInfo &info) {
 
   // 启动 Swift 监控
   startMonitorFunc(OnClipboardChanged);
+  ZLOG_INFO("clipboard", "monitor started (swift)");
 
   return env.Undefined();
 }
@@ -332,6 +341,7 @@ Napi::Value StopMonitor(const Napi::CallbackInfo &info) {
   }
 
   g_isPaused = false; // 重置暂停状态
+  ZLOG_INFO("clipboard", "monitor stopped");
 
   return env.Undefined();
 }
@@ -340,6 +350,7 @@ Napi::Value StopMonitor(const Napi::CallbackInfo &info) {
 Napi::Value PauseMonitor(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
   g_isPaused = true;
+  ZLOG_DEBUG("clipboard", "paused");
   return env.Undefined();
 }
 
@@ -347,6 +358,7 @@ Napi::Value PauseMonitor(const Napi::CallbackInfo &info) {
 Napi::Value ResumeMonitor(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
   g_isPaused = false;
+  ZLOG_DEBUG("clipboard", "resumed");
   return env.Undefined();
 }
 
@@ -632,11 +644,13 @@ Napi::Value GetActiveWindow(const Napi::CallbackInfo &info) {
 
   char *jsonStr = getActiveWindowFunc();
   if (jsonStr == nullptr) {
+    ZLOG_DEBUG("window", "getActiveWindow -> null");
     return env.Null();
   }
 
   std::string jsonString(jsonStr);
   free(jsonStr);
+  ZLOG_DEBUG("window", "getActiveWindow -> %s", jsonString.c_str());
   return ParseJsonValue(env, jsonString);
 }
 
@@ -656,6 +670,8 @@ Napi::Value ActivateWindow(const Napi::CallbackInfo &info) {
 
   std::string bundleId = info[0].As<Napi::String>().Utf8Value();
   int success = activateWindowFunc(bundleId.c_str());
+  ZLOG_INFO("window", "activate \"%s\" -> %s", bundleId.c_str(),
+            success == 1 ? "ok" : "failed");
   return Napi::Boolean::New(env, success == 1);
 }
 
@@ -691,6 +707,7 @@ Napi::Value StartWindowMonitor(const Napi::CallbackInfo &info) {
 
   // 启动 Swift 窗口监控
   startWindowMonitorFunc(OnWindowChanged);
+  ZLOG_INFO("window", "monitor started (swift)");
 
   return env.Undefined();
 }
@@ -708,6 +725,7 @@ Napi::Value StopWindowMonitor(const Napi::CallbackInfo &info) {
     windowTsfn = nullptr;
   }
 
+  ZLOG_INFO("window", "monitor stopped");
   return env.Undefined();
 }
 
@@ -1417,6 +1435,7 @@ Napi::Value PrimeScreenshotFrame(const Napi::CallbackInfo &info) {
   }
 
   const bool success = primeScreenshotFrameFunc() == 1;
+  ZLOG_DEBUG("screenshot", "prime frame -> %d", success ? 1 : 0);
   return Napi::Boolean::New(env, success);
 }
 
@@ -1433,6 +1452,7 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo &info) {
 
   // 重入保护（对齐 Windows g_isCapturing）：会话进行中再次 start 直接抛错
   if (g_screenshotInProgress) {
+    ZLOG_WARN("screenshot", "start requested while a session is already in progress");
     Napi::Error::New(env, "Screenshot already in progress")
         .ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1484,6 +1504,7 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo &info) {
       env, callback, nullptr, resource_name, 0, 1, nullptr, nullptr, nullptr,
       CallScreenshotJs, &screenshotTsfn);
   if (status != napi_ok) {
+    ZLOG_ERROR("screenshot", "create threadsafe function failed");
     Napi::Error::New(env, "Failed to create threadsafe function")
         .ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1497,10 +1518,13 @@ Napi::Value StartRegionCaptureWithPrimedFrame(const Napi::CallbackInfo &info) {
                             "}}";
 
   g_screenshotInProgress = true;
+  ZLOG_INFO("screenshot", "capture session requested (autoConfirm=%d, longCaptureInterval=%dms)",
+            autoConfirm ? 1 : 0, lcInterval);
   int accepted = startRegionCaptureFunc(optionsJson.c_str(), OnScreenshotResult);
   if (accepted != 1) {
     // Swift 拒绝受理（重入兜底/参数非法）：回滚会话状态，保证下次 start 可用；
     // 此路径 Swift 不会回调，TSFN 必须就地释放防泄漏
+    ZLOG_WARN("screenshot", "swift rejected capture session");
     ReleaseScreenshotTsfn();
     g_screenshotInProgress = false;
   }
@@ -1526,6 +1550,10 @@ Napi::Value AbortLongCapture(const Napi::CallbackInfo &info) {
 
 // 模块初始化
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  // 应用 ZTOOLS_LOG_LEVEL 环境变量（须在其他日志写入前调用）
+  ztools_log::InitFromEnv();
+  ZLOG_INFO("core", "=== ztools_native loaded (pid=%u, darwin) ===", ztools_log::ProcessId());
+  ZLOG_DEBUG("core", "log file: %s", ztools_log::FilePath().c_str());
   exports.Set("startMonitor", Napi::Function::New(env, StartMonitor));
   exports.Set("stopMonitor", Napi::Function::New(env, StopMonitor));
   exports.Set("pauseMonitor", Napi::Function::New(env, PauseMonitor));
@@ -1564,6 +1592,21 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("startRegionCaptureWithPrimedFrame",
               Napi::Function::New(env, StartRegionCaptureWithPrimedFrame));
   exports.Set("abortLongCapture", Napi::Function::New(env, AbortLongCapture));
+  // Provider 桥接：让原生层（任意 native 线程）调用 JS 侧注册的方法
+  exports.Set("startProviderBridge",
+              Napi::Function::New(env, ztools_provider_bridge::StartProviderBridge));
+  exports.Set("stopProviderBridge",
+              Napi::Function::New(env, ztools_provider_bridge::StopProviderBridge));
+  exports.Set("resolveProviderBridge",
+              Napi::Function::New(env, ztools_provider_bridge::ResolveProviderBridge));
+  exports.Set("rejectProviderBridge",
+              Napi::Function::New(env, ztools_provider_bridge::RejectProviderBridge));
+  exports.Set("isProviderBridgeReady",
+              Napi::Function::New(env, ztools_provider_bridge::IsProviderBridgeReady));
+  exports.Set("invokeProviderFromNative",
+              Napi::Function::New(env, ztools_provider_bridge::InvokeProviderFromNative));
+  // 日志管理：等级查询/设置、日志文件路径、JS 侧写入同一日志文件
+  ztools_log_binding::Register(env, exports);
   return exports;
 }
 
