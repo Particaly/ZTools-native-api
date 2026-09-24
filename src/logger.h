@@ -238,7 +238,8 @@ inline void FormatTimestamp(char* buf, size_t bufSize) {
                 (unsigned)st.wMilliseconds);
 #else
   struct timeval tv;
-  std::gettimeofday(&tv, nullptr);
+  // gettimeofday 为 POSIX 全局命名空间函数（std::gettimeofday 非标准，macOS 工具链不提供）
+  gettimeofday(&tv, nullptr);
   struct tm tmv;
   localtime_r(&tv.tv_sec, &tmv);
   std::snprintf(buf, bufSize, "%04d-%02d-%02d %02d:%02d:%02d.%03d",

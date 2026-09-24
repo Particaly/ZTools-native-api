@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <cstring>
 #include <dlfcn.h>
 #include <napi.h>
 #include <string>
@@ -42,6 +43,14 @@ typedef void (*ScreenshotResultCB)(const char *);                   // 截图会
 typedef int (*PrimeScreenshotFrameFunc)();                          // 预抓整屏帧（返回 1/0）
 typedef int (*StartRegionCaptureFunc)(const char *, ScreenshotResultCB); // 启动区域截图会话（返回 1 受理/0 拒绝）
 typedef void (*AbortLongCaptureFunc)();                             // 中止长截图滚动捕获
+typedef int32_t (*ProviderInvokeAsyncCB)(uint64_t, const char *, const char *,
+                                         char **); // Swift 侧 provider 异步调用（invokeAsync 包装）
+typedef void (*ProviderCancelCB)(uint64_t);        // Swift 侧 provider 请求取消包装
+typedef int32_t (*ProviderReadyCB)(void);          // Swift 侧 provider 桥就绪查询
+typedef int32_t (*RegisterNativeBridgeFunc)(ProviderInvokeAsyncCB, ProviderCancelCB,
+                                            ProviderReadyCB); // 注册原生桥函数指针（进程级一次）
+typedef void (*ProviderResultForSwiftFn)(uint64_t, int32_t, const char *,
+                                         const char *); // Swift 侧结果接收（bridge 异步回投目标）
 
 // 全局变量
 static void *swiftLibHandle = nullptr;
@@ -84,6 +93,62 @@ static AbortLongCaptureFunc abortLongCaptureFunc = nullptr;
 // Swift 会话出口回调（OnScreenshotResult）或 Swift 拒绝受理时复位 false。
 // JS 线程串行读写，Swift 侧仅通过回调间接复位，无需更强同步。
 static std::atomic<bool> g_screenshotInProgress(false);
+
+// ==================== 原生桥 C 包装（供 Swift dylib 经函数指针调用） ====================
+// 背景：Provider 桥（provider_bridge.h）的 TSFN/登记表存活于本 .node 模块内，
+// Swift dylib 无法直接链接；库加载时经 ztoolsRegisterNativeBridge 把下列包装的
+// 函数指针注入 Swift 侧（进程级一次）。macOS 截图翻译走异步通路（InvokeAsync +
+// requestId + 结果回调），Swift 发起后立即返回，不阻塞等待 JS——截图会话为
+// 非阻塞生命周期对象，N-API 调用栈立即返回，宿主进程（Electron 主进程等）的
+// 事件循环照常运转 Node/libuv/V8 与 AppKit，TSFN 派发与 provider 网络请求由
+// 宿主自身驱动，无需截图模块补驱动。
+// 约定：errorOut 为 malloc 分配的 C 字符串，调用方（Swift）用毕 free。
+
+// provider 桥就绪查询（转发 ztools_provider_bridge::IsReady）。
+extern "C" int32_t ZtoolsProviderIsReadyForSwift() {
+  return ztools_provider_bridge::IsReady() ? 1 : 0;
+}
+
+// Swift 侧结果接收函数（dlsym 自 dylib 的 ztoolsSwiftProviderResultHandler，
+// LoadSwiftLibrary 时解析；库加载后恒有效）。回投线程 = 触发来源线程（JS 线程），
+// Swift 实现只做线程安全入队。
+static ProviderResultForSwiftFn providerResultForSwift = nullptr;
+
+// 桥异步回调适配：把 InvokeAsync 的结果转投给 Swift 侧结果接收函数。
+static void ProviderResultTrampoline(uint64_t requestId, bool ok, const char *valueJson,
+                                     const char *error, void * /*userData*/) {
+  if (providerResultForSwift != nullptr) {
+    providerResultForSwift(requestId, ok ? 1 : 0, valueJson, error);
+  }
+}
+
+// provider 桥异步调用（转发 ztools_provider_bridge::InvokeAsync）：非阻塞，
+// 可在包括 JS 主线程在内的任意线程调用；受理后结果经
+// ztoolsSwiftProviderResultHandler 异步回投 Swift，恰好一次（拒绝时不回投）。
+// 超时由 Swift 侧驱动（deadline 扫描 + ZtoolsProviderCancelRequestForSwift）。
+// 返回 1 已受理 / 0 拒绝（*errorOut 置为可读错误）。
+extern "C" int32_t ZtoolsProviderInvokeAsyncForSwift(uint64_t requestId, const char *type,
+                                                     const char *inputJson, char **errorOut) {
+  if (errorOut != nullptr) *errorOut = nullptr;
+  if (providerResultForSwift == nullptr) {
+    if (errorOut != nullptr) *errorOut = strdup("provider result handler not registered");
+    return 0;
+  }
+  ztools_provider_bridge::InvokeAccept accept = ztools_provider_bridge::InvokeAsync(
+      requestId, type != nullptr ? type : "", inputJson != nullptr ? inputJson : "",
+      ProviderResultTrampoline, nullptr);
+  if (!accept.accepted) {
+    if (errorOut != nullptr) *errorOut = strdup(accept.error.c_str());
+    return 0;
+  }
+  return 1;
+}
+
+// 取消一个进行中的异步 provider 请求（转发 ztools_provider_bridge::CancelAsync）：
+// 登记立即移除，JS 晚到的回传被桥静默丢弃（不触发 Swift 回调）；幂等。
+extern "C" void ZtoolsProviderCancelRequestForSwift(uint64_t requestId) {
+  ztools_provider_bridge::CancelAsync(requestId);
+}
 
 // 在主线程调用 JS 回调
 void CallJs(napi_env env, napi_value js_callback, void *context, void *data) {
@@ -269,6 +334,24 @@ bool LoadSwiftLibrary(Napi::Env env) {
       (StartRegionCaptureFunc)dlsym(swiftLibHandle, "startRegionCaptureWithPrimedFrame");
   abortLongCaptureFunc =
       (AbortLongCaptureFunc)dlsym(swiftLibHandle, "abortLongCapture");
+  // 原生桥注册（截图翻译用：provider 异步调用 / 请求取消 / 就绪查询三个包装的
+  // 函数指针注入 Swift；结果回投方向经 dlsym 解析 Swift 侧导出）。
+  // 注册失败不阻断库加载（旧 dylib 无该导出时仅翻译功能降级），日志记录。
+  providerResultForSwift =
+      (ProviderResultForSwiftFn)dlsym(swiftLibHandle, "ztoolsSwiftProviderResultHandler");
+  if (providerResultForSwift == nullptr) {
+    ZLOG_WARN("core", "ztoolsSwiftProviderResultHandler not found (translate disabled)");
+  }
+  RegisterNativeBridgeFunc registerNativeBridge =
+      (RegisterNativeBridgeFunc)dlsym(swiftLibHandle, "ztoolsRegisterNativeBridge");
+  if (registerNativeBridge != nullptr) {
+    int32_t registered = registerNativeBridge(ZtoolsProviderInvokeAsyncForSwift,
+                                              ZtoolsProviderCancelRequestForSwift,
+                                              ZtoolsProviderIsReadyForSwift);
+    ZLOG_INFO("core", "native bridge registered for swift dylib -> %d", registered);
+  } else {
+    ZLOG_WARN("core", "ztoolsRegisterNativeBridge not found (translate disabled)");
+  }
 
   if (!startMonitorFunc || !stopMonitorFunc || !startWindowMonitorFunc ||
       !stopWindowMonitorFunc || !getActiveWindowFunc || !activateWindowFunc ||
@@ -1605,6 +1688,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
               Napi::Function::New(env, ztools_provider_bridge::IsProviderBridgeReady));
   exports.Set("invokeProviderFromNative",
               Napi::Function::New(env, ztools_provider_bridge::InvokeProviderFromNative));
+  exports.Set("invokeProviderAsyncFromNative",
+              Napi::Function::New(env, ztools_provider_bridge::InvokeProviderAsyncFromNative));
+  exports.Set("cancelProviderAsyncFromNative",
+              Napi::Function::New(env, ztools_provider_bridge::CancelProviderAsyncFromNative));
   // 日志管理：等级查询/设置、日志文件路径、JS 侧写入同一日志文件
   ztools_log_binding::Register(env, exports);
   return exports;

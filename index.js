@@ -579,7 +579,7 @@ class ScreenCapture {
    *   拼接无帧数/像素上限，可持续合并至用户主动结束
    * @param {number} [options.longCapture.interval=250] - 滚轮停止后等待内容稳定的毫秒数（50~2000，采样防抖；
    *   滚动进行中也会按不低于 min(interval, 250)ms 的节拍主动采样，保证相邻帧有大重叠区域）
-   * 编辑态工具栏另有「翻译」按钮（仅 Windows）：OCR 识别选区文字 → 翻译 → 译文覆盖原文字区域，
+   * 编辑态工具栏另有「翻译」按钮（Windows/macOS）：OCR 识别选区文字 → 翻译 → 译文覆盖原文字区域，
    * 依赖 ProviderBridge 注册默认启用的 ocr/translation provider（约定见 README「截图翻译」）；
    * 确认/保存导出的图像同样包含译文覆盖
    * @param {Function} [callback] - 截图完成时的回调函数
@@ -598,8 +598,11 @@ class ScreenCapture {
    *   马赛克/撤销重做/选区圆角）、圆角透明导出、保存对话框与长截图全子系统均已实现，
    *   行为与 Windows 版对齐；差异项见 README「平台差异」表
    * - 额外需要辅助功能权限：ESC/右键兜底取消、长截图滚轮观察与 autoScroll（CGEventTap）
-   * - macOS 的 start() 会阻塞 JS 主线程直至会话收束（覆盖层事件循环运行在调用线程上），
-   *   会话期间无法用本进程定时器触发 abortLongCapture，需要时请从另一进程/线程调用
+   * - macOS 的 start() 为**非阻塞**调用：创建会话后立即返回，结果经 callback 异步送达；
+   *   会话期间 AppKit 事件与 Node/libuv 事件循环均由宿主进程自身的主事件循环驱动
+   *   （Electron 主进程天然满足），会话期间可正常使用本进程定时器/异步逻辑
+   *   （如定时触发 abortLongCapture）。纯 Node 宿主不驱动 macOS 主事件循环，
+   *   无法运行截图会话，请在 Electron 宿主中使用（见 README「平台差异」）
    *
    * @example
    * // 默认：框选/点选完成即出图，不再二次编辑
@@ -633,8 +636,8 @@ class ScreenCapture {
   /**
    * 中止进行中的长截图滚动捕获（Windows / macOS 双平台）
    * 滚动捕获会以失败结果（success: false）回调后结束（ESC/取消同语义：取消 = 失败收束）；
-   * 无进行中的长截图时为安全空操作。可在任意线程/进程调用（macOS 会话期间 JS 主线程
-   * 被阻塞时，从另一进程或工作线程调用即可，见 test/test-screenshot-mac.js 的注入示例）
+   * 无进行中的长截图时为安全空操作，可在任意线程/进程调用（macOS start() 为非阻塞
+   * 调用，会话期间本进程定时器/异步逻辑照常运转，可直接调用本方法）
    */
   static abortLongCapture() {
     addon.abortLongCapture();
@@ -828,10 +831,10 @@ function launchCuiShell(shell, currentDirectory) {
  *     return await providerManager.invoke(type, input);
  *   });
  *
- * 内置约定（Windows 截图工具栏「翻译」按钮依赖以下两个类型，详见 README「截图翻译」）：
+ * 内置约定（截图工具栏「翻译」按钮依赖以下两个类型，详见 README「截图翻译」）：
  * - ocr: { image } => { text, blocks: [{ text, left, top, right, bottom }] }
  *   （blocks 为行级坐标块；provider 只回整段 text 时原生自动走整图兜底）
- * - translation: { text } => { text }（OCR 多行结果由原生逐行分别调用）
+ * - translation: { text } => { text }（OCR 多行结果由原生按聚类段落分别调用）
  *
  * 原生侧（C++/Swift）调用方式见 src/provider_bridge.h 的
  * ztools_provider_bridge::Invoke(type, inputJson, timeoutMs)。
@@ -853,10 +856,18 @@ const ProviderBridge = {
       throw new TypeError('ProviderBridge.start requires a handler function');
     }
     addon.startProviderBridge((type, inputJson, seq) => {
-      Promise.resolve()
-        .then(() => handler(type, JSON.parse(inputJson)))
-        .then((result) => {
-          addon.resolveProviderBridge(seq, JSON.stringify(result === undefined ? null : result));
+      // handler 同步启动：分发即开始执行（含同步抛错经 reject 回传），异步续体由
+      // 宿主事件循环的常规回调边界推进并排空 microtask
+      let result;
+      try {
+        result = handler(type, JSON.parse(inputJson));
+      } catch (err) {
+        addon.rejectProviderBridge(seq, err instanceof Error ? err.message : String(err));
+        return;
+      }
+      Promise.resolve(result)
+        .then((value) => {
+          addon.resolveProviderBridge(seq, JSON.stringify(value === undefined ? null : value));
         })
         .catch((err) => {
           addon.rejectProviderBridge(seq, err instanceof Error ? err.message : String(err));
@@ -881,7 +892,7 @@ const ProviderBridge = {
   },
 
   /**
-   * 从 JS 侧发起一次“原生发起”的调用：走真实原生线程 → JS 线程的完整通路，
+   * 从 JS 侧发起一次"原生发起"的调用：走真实原生线程 → JS 线程的完整通路，
    * 用于验证桥接链路（原生业务代码应直接调用 C++ 的 Invoke，而不是本方法）。
    * @param {string} type - 能力类型
    * @param {any} input - 入参（自动 JSON 序列化传给 handler）
@@ -907,6 +918,55 @@ const ProviderBridge = {
         }
       );
     });
+  },
+
+  /**
+   * 从 JS 侧发起一次"原生发起"的异步调用：走与 macOS 截图翻译完全相同的异步通路
+   * （原生 InvokeAsync + requestId + 看门狗超时 + CancelAsync 丢弃晚到结果），
+   * 用于验证异步桥接（原生业务代码应直接调用 C++ 的 InvokeAsync，而不是本方法）。
+   * @param {string} type - 能力类型
+   * @param {any} input - 入参（自动 JSON 序列化传给 handler）
+   * @param {number} requestId - 请求号（调用方保证唯一；用于 cancelFromNative 取消）
+   * @param {number} [timeoutMs=15000] - 超时毫秒数（到时取消请求并 reject；handler
+   *                                      晚到的 resolve/reject 被原生侧丢弃）
+   * @returns {Promise<any>} handler 的返回值；桥接未就绪/超时/handler 抛错时 reject
+   */
+  invokeFromNativeAsync(type, input, requestId, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn, arg) => {
+        if (settled) return;   // 晚到结果（已超时/已取消）静默丢弃
+        settled = true;
+        fn(arg);
+      };
+      addon.invokeProviderAsyncFromNative(
+        type,
+        JSON.stringify(input === undefined ? null : input),
+        requestId,
+        timeoutMs,
+        (err, resultJson) => {
+          if (err) {
+            finish(reject, new Error(err));
+            return;
+          }
+          try {
+            finish(resolve, JSON.parse(resultJson));
+          } catch (parseErr) {
+            finish(reject, parseErr);
+          }
+        }
+      );
+    });
+  },
+
+  /**
+   * 取消一个经 invokeFromNativeAsync 发起的请求（幂等；已回调/已取消时为 false）。
+   * 取消后 handler 晚到的 resolve/reject 被原生侧按 requestId 丢弃。
+   * @param {number} requestId - 请求号
+   * @returns {boolean} 是否确由本次调用完成取消
+   */
+  cancelFromNative(requestId) {
+    return addon.cancelProviderAsyncFromNative(requestId);
   }
 };
 

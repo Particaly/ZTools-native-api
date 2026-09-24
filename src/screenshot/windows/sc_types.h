@@ -219,19 +219,14 @@ enum TranslateOverlayState {
 };
 
 // 一个译文覆盖块：OCR 识别出的原文字区域（绝对虚拟屏幕逻辑坐标，与标注同坐标系，
-// 选区移动/缩放时保持不动）+ 译文文本 + 原段落版面特征。绘制与导出合成见
-// translate_windows.cpp：字号按段落独立搜索（密度对齐原段落，见 FitParagraph），
-// 搜索含多次真实排版测量，结果缓存在 fit* 字段（键 = 绘制时框宽高）。
+// 选区移动/缩放时保持不动）+ 译文文本 + 原段落行数。绘制与导出合成见
+// translate_windows.cpp：字号按段落独立搜索（行距对齐 + 框高可行性收缩，见
+// FitParagraph），搜索含多次真实排版测量，结果缓存在 fit* 字段（键 = 绘制时框宽高）。
 
 struct TranslateBlock {
     RECT box;               // 原文字区域（绝对虚拟屏幕逻辑坐标，已与选区求交）
     std::wstring text;      // 译文
-    double lineHeightPx = 0; // 原文单行行高估计（逻辑像素；成员行高中位数，
-                            // 作为原字号估计 / 字号搜索锚点的基准）
-    // ---- 原段落版面特征（来自聚类成员行；整图兜底块 origLineCount = 0 表示未知）----
-    int origLineCount = 0;      // 原段落行数
-    double origWidthUtil = 0;   // 原平均行宽利用率 = 成员行宽均值 / 段宽
-    double origVDensity = 0;    // 原垂直密度 = 行数 × 中位行高 / 段高
+    int origLineCount = 0;  // 原段落行数（整图兜底块 = 0 表示未知，用默认字号上限）
     // ---- 排版缓存（绘制线程写；fitKeyW/H 命中时复用以下三字段，免每帧重排）----
     int fitKeyW = -1, fitKeyH = -1;      // 缓存键：绘制时（与选区交集后的）框宽高
     int fitFontPx = 0;                   // 搜索定出的最终字号

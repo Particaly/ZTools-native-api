@@ -5,7 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const ROOT = path.resolve(__dirname, '..')
-const PLUGIN = path.resolve(ROOT, '..', 'ZTools-plugins-collection', 'f-provider', 'dist')
+const PLUGIN = path.resolve(ROOT, '..', 'ZTools-collection', 'f-provider', 'dist')
 const src = fs.readFileSync(path.join(PLUGIN, 'preload', 'services.js'), 'utf8')
 
 const sandboxWindow = { __registered: {} }

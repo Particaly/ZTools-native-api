@@ -1,4 +1,4 @@
-// 截图翻译（编辑态工具栏「翻译」按钮）交互式测试：Windows 真机手工验收。
+// 截图翻译（编辑态工具栏「翻译」按钮）交互式测试：真机手工验收。
 //
 // 验证目标：原生层「ocr（行级坐标）→ 文本行空间聚类成段落 → 逐段 translation」
 // 编排链路（聚类算法的纯逻辑回归见 scripts/run-translate-cluster-selftest.cmd）。
@@ -9,6 +9,15 @@
 //   4. 点「确定」导出：译文面板合成进最终图像；ESC/取消则放弃。
 //   5. 控制台会打印桥接调用序列与每次 translation 的入参（可核对段落拼接结果：
 //      英文段内空格连接、中文紧排直连）。
+//
+// 平台注意：
+//   - Windows：截图 UI 跑在独立线程，JS 事件循环照常前进，本脚本开箱即用。
+//   - macOS：截图会话为非阻塞生命周期对象，AppKit 事件与 Node 事件循环都依赖
+//     宿主进程自己的主事件循环驱动——纯 Node 宿主不运转 macOS 主事件循环，
+//     请用 Electron 宿主运行本测试（macOS 全功能截图翻译的验收环境）：
+//       npx electron test/electron-host.cjs test/test-translate.js
+//     （翻译为异步 RPC，requestId 驱动；桥接层语义（同步/Promise/延迟/超时/取消/
+//     晚到丢弃/并发）另由 test/test-provider-async-bridge.js 覆盖，后者无需 Electron）。
 //
 // 运行方式：
 //   node test/test-translate.js            # 默认：6 行英文 → 2 个段落

@@ -18,7 +18,7 @@ macOS 和 Windows 原生 API 的 Node.js 封装，使用 Swift + Win32 API + Nod
 12. **取色器** - 全屏取色工具
 13. **设置文件窗口地址栏** - 跳转 Finder/Explorer 或文件选择对话框到指定路径
 14. **Provider 桥接** - 让原生层（任意 native 线程上的 C++/Swift 代码）调用 JS 侧注册的方法（如宿主应用的翻译 / OCR 提供商）
-15. **截图翻译** - 编辑态工具栏「翻译」按钮：原生编排 OCR（行级坐标）→ 逐行翻译 → 译文覆盖原文字区域（依赖 Provider 桥接，Windows）
+15. **截图翻译** - 编辑态工具栏「翻译」按钮：原生编排 OCR（行级坐标）→ 聚类成段 → 逐段翻译 → 译文覆盖原文字区域（依赖 Provider 桥接，Windows/macOS）
 
 ## 🔧 系统要求
 
@@ -343,12 +343,15 @@ WindowManager.simulatePaste();
 **平台差异**：
 - **交互流程一致**：全屏暗化覆盖层 + 拖拽选区/单击智能窗口吸附 → autoConfirm=true 松手直接出图，
   autoConfirm=false 进入编辑态（工具栏 16 按钮、矩形/圆形/箭头/画笔/文字/马赛克标注、撤销/重做、
-  选区圆角手柄）→ 确定/保存/取消/长截图/翻译（翻译仅 Windows，依赖 Provider 桥接，见下文）
+  选区圆角手柄）→ 确定/保存/取消/长截图/翻译（依赖 Provider 桥接，见下文）
 - **macOS**:
   - 需要屏幕录制权限（未授权时首次 `start()` 弹系统授权框，拒绝后回调 `{ success: false, error: ... }`）
   - 另需辅助功能权限：ESC/右键兜底取消（覆盖层失焦时仍可取消）、长截图滚轮观察与自动滚动（CGEventTap）
-  - `start()` 会**阻塞 JS 主线程**直至会话收束（覆盖层事件循环运行在调用线程上）；
-    长截图会话期间需从中止时，请从另一进程/线程调用 `abortLongCapture()`
+  - `start()` 为**非阻塞**调用：创建会话后立即返回，结果经 callback 异步送达；会话期间
+    AppKit 事件与 Node/libuv 事件循环均由宿主进程自己的主事件循环驱动（Electron 主进程
+    天然满足），会话中可正常使用定时器/异步逻辑（如定时调用 `abortLongCapture()`）。
+    纯 Node 宿主不驱动 macOS 主事件循环，无法运行截图会话——交互式验收请用
+    `npx electron test/electron-host.cjs test/test-screenshot.js`
   - 选区坐标为屏幕全局逻辑坐标（左上原点）；输出图像为逻辑尺寸（Retina 下内部按物理像素捕获后缩回）
 - **Windows**: 全屏遮罩 + 拖拽选区 + 编辑标注 + 长截图全功能（坐标系为虚拟屏绝对坐标）
 - 会话进行中重复调用 `start()` 会抛出 `Error('Screenshot already in progress')`（双平台一致）
@@ -367,7 +370,7 @@ ScreenCapture.start((result) => {
 
 #### `ScreenCapture.abortLongCapture()`
 中止进行中的长截图滚动捕获。滚动捕获会以失败结果（`success: false`）回调后结束（ESC/工具栏取消同语义：取消 = 失败收束）；无进行中的长截图时为安全空操作。
-- **平台**: ✅ Windows 和 macOS。macOS 的 `start()` 阻塞 JS 主线程期间，可从另一进程/工作线程调用（参考 `test/test-screenshot-mac.js` 的子进程注入示例）
+- **平台**: ✅ Windows 和 macOS。macOS 的 `start()` 为非阻塞调用，会话期间本进程定时器/异步逻辑照常运转，可直接在进程内调用
 
 ---
 
@@ -479,15 +482,43 @@ if (r.ok) {
 - 支持并发调用（按 `seq` 配对请求与结果）；`stop()` 会立即让等待中的调用失败
 - 数据以 JSON 字符串穿越桥接，请保持入参/返回值可 JSON 序列化
 
+除同步 `Invoke` 外，桥接层另提供**异步 RPC**（macOS 截图翻译的生产通路）：原生侧
+`InvokeAsync(requestId, type, inputJson, callback, userData)` 发起后立即返回，结果由
+JS 侧回传时经 callback 异步送达（恰好一次）；`CancelAsync(requestId)` 取消请求，
+此后 JS 晚到的结果按 `seq` 查表落空被静默丢弃。异步 API 非阻塞，可在包括 JS 主线程
+在内的任意线程调用；超时由调用方驱动（deadline 扫描 + CancelAsync）。从 JS 侧可走
+真实通路验证：
+
+```javascript
+// 异步通路验证（原生 InvokeAsync + requestId + 看门狗超时 + CancelAsync 丢晚到）：
+const result = await ProviderBridge.invokeFromNativeAsync('translation', { text: 'hello' }, 1001, 5000);
+ProviderBridge.cancelFromNative(1001);   // 取消在飞请求（幂等）
+```
+
+对应的原生侧用法（见 `src/provider_bridge.h`）：
+
+```cpp
+// 异步：立即返回受理与否，结果经 callback(requestId, ok, value, error) 回投
+ztools_provider_bridge::InvokeAccept a =
+    ztools_provider_bridge::InvokeAsync(1001, "translation", "{\"text\":\"hi\"}",
+                                        MyCallback, myUserData);
+if (!a.accepted) { /* 不会触发回调，当场收尾 */ }
+ztools_provider_bridge::CancelAsync(1001);   // 取消：晚到结果被丢弃
+```
+
 ### 截图翻译（编辑态工具栏「翻译」按钮，依赖 Provider 桥接）
 
 编辑态（`autoConfirm: false`）工具栏的「翻译」按钮：点击后原生层自动完成
-**OCR 识别选区文字 → 逐行翻译 → 译文覆盖原文字区域**，确认/保存导出的图像同样包含译文覆盖。
-覆盖展示中再次点击「翻译」会清掉旧结果并按当前选区重跑。
+**OCR 识别选区文字 → 空间聚类还原段落 → 逐段翻译 → 译文覆盖原文字区域**，确认/保存导出的
+图像同样包含译文覆盖。覆盖展示中再次点击「翻译」为切换退出（清掉译文覆盖、取消按钮激活，
+不重跑）；需要重译时再点一次重新发起。
 
 编排发生在原生层：先调 type=`ocr` 拿到带行级坐标（top/left/right/bottom）的文本行数组，
-再对每一行分别调 type=`translation`（translation 契约入参为单条 text，多行需逐行请求），
-最后在原生侧把译文与坐标合并、按行高适配字号渲染。OCR/翻译渠道沿用用户在设置页
+再把文本行按空间关系聚类还原成段落（`src/screenshot/algo/translate_cluster.cpp`，跨平台
+共用：行高/行距估计 → 候选相邻 → 多维特征判定连续/边界 → 聚合 + 孤行吸收，解决 OCR 按行
+输出导致的段落信息丢失），然后对每个段落分别调一次 type=`translation`（段落文本已按 CJK/拉丁
+规则拼接；macOS 以有限并发逐段调用、Windows 串行调用以尊重 provider 限流），最后在原生侧把译文与对应段落的成员行
+联合框合并成可渲染块、按段落版面特征适配字号渲染。OCR/翻译渠道沿用用户在设置页
 选择的默认提供商——宿主只需把桥接类型透传给 providerManager：
 
 ```javascript
@@ -522,14 +553,24 @@ provider 约定（原生侧已按此实现）：
 
 - OCR 未返回坐标（blocks 为字符串数组或仅有 text，如纯文本 AI 识别）时走整图兜底：
   整段文本一次翻译，以整个选区为单一覆盖面板
-- 逐行翻译串行执行；单行失败跳过该行（日志可见），全部失败才整体报错
+- 单段失败/超时跳过该段（日志可见），全部失败才整体报错；macOS 为有限并发
+  （同时在飞 ≤2，完成即补发），Windows 保持逐段串行（尊重 provider 限流）
+- macOS 全链路为**异步 RPC**（requestId 驱动）：每个请求有唯一 `jobId`/`requestId`，
+  晚到结果（已超时/已取消/任务已换代）按 requestId 匹配落空直接丢弃，绝不污染当前 UI
 
 交互细节：
-- 点击「翻译」→ 选区上方出现「正在识别并翻译…」进度气泡（OCR 超时 30 秒、单行翻译超时 15 秒）
-- 成功 → 每个文字行以白底圆角面板盖住原文并排入译文，字号按行高适配
-  （装不下时自动扩展/缩小字号/省略号截断）
+- 点击「翻译」→ 选区上方出现「正在识别并翻译…」进度气泡（OCR 超时 30 秒、单段翻译超时 15 秒）
+- 成功 → 每个段落以白底圆角面板盖住原文并排入译文，译文字号按段落独立搜索
+  （以原字号估计为锚点，可行性二分 + 候选真实排版测量评分，取综合视觉密度最接近原段落者；
+  装不下时向下扩高并省略号截断）
 - 失败（OCR/翻译出错、未识别到文字、超时等）→ 深红文字错误气泡，约 4 秒后自动消失
-- **平台**: ✅ Windows（macOS 编辑态工具栏暂无翻译按钮）
+- **平台**: ✅ Windows 和 macOS（全功能对等）。macOS 截图会话为**非阻塞生命周期对象**
+  （`start()` 立即返回，AppKit 事件与周期任务由宿主进程主事件循环驱动，交互式验收
+  请用 Electron 宿主，见上文「平台差异」）；翻译全链路为**异步 RPC**（requestId 驱动）：
+  每个请求有唯一 `jobId`/`requestId`，provider 的 Promise/网络请求由宿主进程自身的
+  事件循环驱动（Electron 主进程消息泵在会话期间持续运转 libuv 与 NSApp），原生侧
+  不手动泵 `uv_run`/V8 微任务——纯 Node 宿主无法运行 macOS 截图会话，
+  请在 Electron 宿主中使用截图翻译
 
 
 ## 🗒️ 原生日志（Logger）
@@ -595,9 +636,12 @@ node test/test-keyboard.js         # 完整键盘测试
 node test/test-keyboard-simple.js  # 简单键盘测试
 node test/test-selected-content.js # 获取选中内容测试
 node test/test-provider-bridge.js  # Provider 桥接（原生层调用 JS 方法）测试
-node test/test-screenshot-mac.js   # macOS 区域截图交互测试（真机手工验收，见脚本头说明）
+node test/test-provider-async-bridge.js  # Provider 异步桥接（requestId/超时/取消/晚到丢弃/并发）测试
+node test/test-screenshot.js       # 区域截图交互测试（真机手工验收；macOS 用
+                                   #   npx electron test/electron-host.cjs test/test-screenshot.js）
 node test/test-translate.js        # 截图翻译交互测试（mock provider，真机手工验收，见脚本头说明；
-                                   #   MODE=plain 环境变量切换无坐标兜底模式）
+                                   #   MODE=plain 环境变量切换无坐标兜底模式；macOS 用
+                                   #   npx electron test/electron-host.cjs test/test-translate.js）
 node test/test-logger.js           # 原生日志（等级/文件/轮转）测试
 ```
 
@@ -611,7 +655,7 @@ node test/test-logger.js           # 原生日志（等级/文件/轮转）测�
 | **键盘模拟** | ✅ 需要辅助功能权限 | ✅ 无需特殊权限 |
 | **区域截图** | ✅ 支持（全功能：选区 + 标注 + 圆角导出 + 保存） | ✅ 支持（全功能：选区 + 标注 + 圆角导出 + 保存） |
 | **长截图** | ✅ 支持（拼接/自动滚动/小地图/裁剪） | ✅ 支持（拼接/自动滚动/小地图/裁剪） |
-| **截图线程模型** | ⚠️ `start()` 阻塞 JS 主线程直至会话收束（覆盖层事件循环在调用线程上） | 独立捕获线程，`start()` 立即返回 |
+| **截图线程模型** | ✅ 非阻塞会话（`start()` 立即返回；AppKit 事件与 Node 事件循环均由宿主主事件循环驱动，需 Electron 等 NSApplication 宿主） | 独立捕获线程，`start()` 立即返回 |
 | **截图标注** | ✅ 矩形/椭圆/箭头/画笔/文字（IME）/马赛克，行为对齐 | ✅ 同左 |
 | **截图输出** | ✅ PNG base64 + 剪贴板（原生支持透明 alpha）+ 保存对话框 + 圆角透明导出 | ✅ 同左（圆角透明走 `CF_DIB(V4)+PNG` 双格式） |
 | **获取选中内容** | ✅ 支持（模拟复制） | ✅ 支持（UI Automation + 剪贴板回退） |
@@ -634,10 +678,12 @@ node test/test-logger.js           # 原生日志（等级/文件/轮转）测�
 - **截图完整体验还建议授予辅助功能权限**：
   - ESC/右键兜底取消（覆盖层失焦时仍可取消，未授权时降级为覆盖层自身按键处理）
   - 长截图的滚轮观察与自动滚动（CGEventTap）
-- **macOS 截图会话会阻塞 JS 主线程**：`start()` 从调用起阻塞至会话收束（回调在其后触发）；
-  Electron/Node 宿主如需在会话期间执行其他逻辑，请放在 worker 线程或提前调度
-- **交互测试脚本**：`node test/test-screenshot-mac.js`（权限预检 / 成功回调契约 / 编辑态与
-  ESC 取消 / 长截图 abort，全交互式，需在真机上按脚本指引执行）
+- **macOS 截图会话为非阻塞生命周期对象**：`start()` 创建会话后立即返回，结果经回调异步送达；
+  会话期间 AppKit 事件（覆盖层交互/绘制）与周期任务（翻译回投、插入符闪烁、长截图采样）
+  均由宿主进程自己的主事件循环驱动——Electron 主进程天然满足；纯 Node 宿主不运转
+  macOS 主事件循环，无法运行截图会话（交互式验收用 `npx electron test/electron-host.cjs …`）
+- **交互测试脚本**：`node test/test-screenshot.js`（权限预检 / 成功回调契约 / 编辑态与
+  ESC 取消 / 长截图 abort，全交互式，需在真机上按脚本指引执行；macOS 需 Electron 宿主）
 
 ### Windows
 - Process ID 每次启动都会变化，不适合持久化存储

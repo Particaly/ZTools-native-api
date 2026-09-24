@@ -6942,6 +6942,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("rejectProviderBridge", Napi::Function::New(env, ztools_provider_bridge::RejectProviderBridge));
     exports.Set("isProviderBridgeReady", Napi::Function::New(env, ztools_provider_bridge::IsProviderBridgeReady));
     exports.Set("invokeProviderFromNative", Napi::Function::New(env, ztools_provider_bridge::InvokeProviderFromNative));
+    exports.Set("invokeProviderAsyncFromNative", Napi::Function::New(env, ztools_provider_bridge::InvokeProviderAsyncFromNative));
+    exports.Set("cancelProviderAsyncFromNative", Napi::Function::New(env, ztools_provider_bridge::CancelProviderAsyncFromNative));
     // 日志管理：等级查询/设置、日志文件路径、JS 侧写入同一日志文件
     ztools_log_binding::Register(env, exports);
     return exports;

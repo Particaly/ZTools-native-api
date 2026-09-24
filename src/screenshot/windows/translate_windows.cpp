@@ -13,17 +13,16 @@
 //         解决 OCR 按行输出导致的段落信息丢失），再对每个段落调用一次
 //         type="translation"（契约入参为单条 text，段落文本已按 CJK/拉丁规则拼接；
 //         段为单位串行调用以尊重 provider 限流），在原生层把译文与对应段落的成员行
-//         联合框合并成可渲染块，段落原文行高中位数随块带给渲染层定字号；
+//         联合框合并成可渲染块，段落原文行数随块带给渲染层定字号；
 //         OCR provider 未返回坐标（如纯文本 AI 识别）时走整图兜底：整段文本一次
 //         翻译、以整个选区为单一面板；
 //   3. 结果打包后经「单飞行结果槽 + PostMessage」回投截图线程：译文块坐标换算回
-//      选区绝对逻辑坐标存入 ctx（连同原段落版面特征：行数/行宽利用率/垂直密度），
-//      进入 TRL_Shown；OnPaint 在标注之上绘制译文覆盖面板（白底盖住原文字），
-//      译文字号按段落独立搜索：以原字号估计为锚点，可行性（总高不超段高）二分 +
-//      候选真实排版测量评分，取综合视觉密度最接近原段落者（见 sctranslatedraw::
-//      FitParagraph），确认/保存导出时同样合成进最终图像。TRL_Shown 下再次点击
-//      「翻译」为切换退出：清除覆盖回到 TRL_Idle 并取消按钮激活，不重跑翻译；
-//      需重译时再点一次重新发起即可。
+//      选区绝对逻辑坐标存入 ctx（连同原段落行数），进入 TRL_Shown；OnPaint 在标注
+//      之上绘制译文覆盖面板（白底盖住原文字），译文字号按段落独立搜索：min(能装进
+//      段框的最大字号, 原文行距对应字号)——行距对齐保证观感与原版面一致、可行性
+//      收缩保证译文变长时放得下（见 sctranslatedraw::FitParagraph），确认/保存导出
+//      时同样合成进最终图像。TRL_Shown 下再次点击「翻译」为切换退出：清除覆盖
+//      回到 TRL_Idle 并取消按钮激活，不重跑翻译；需重译时再点一次重新发起即可。
 //
 // provider 约定（宿主 JS 侧 ProviderBridge.start 的 handler 直接映射 providerManager.invoke）：
 //   ocr:        入参 {"image":"data:image/png;base64,..."}
@@ -333,17 +332,13 @@ void TeardownTranslateJobs() {
 // ==================== provider 响应解析与调用辅助 ====================
 
 // OCR 文本行（提交图像内的像素坐标；text 先为 OCR 原文，翻译成功后替换为译文）。
-// lineH 为该块的原文单行行高估计（段落块 = 成员行高中位数），orig* 为原段落
-// 版面特征（行数 / 行宽利用率 / 垂直密度，由聚类成员行统计），随块流向下
-// 渲染层作为字号搜索的密度对齐目标（兜底块 origLineCount = 0 表示未知）。
+// origLineCount 为原段落行数（段落块 = 聚类成员行数），随块流向下渲染层，作为
+// 行距对齐字号搜索的输入（兜底块 origLineCount = 0 表示未知）。
 
 struct OcrRawBlock {
     std::string text;
     double x = 0, y = 0, w = 0, h = 0;
-    double lineH = 0;
     int origLineCount = 0;
-    double origWidthUtil = 0;
-    double origVDensity = 0;
 };
 
 // 从 ocr 响应解析文本行：{"text":"..","blocks":[{text,left,top,right,bottom},..],"confidence":..}。
@@ -484,9 +479,16 @@ static void TranslateWorkerMain(TranslateJobInput* job) {
         std::vector<std::string> plainTexts;  // 无坐标的文本（兜底用）
         ParseOcrBlocks(ocrRoot, lines, plainTexts);
         if (lines.empty() && plainTexts.empty()) {
-            ZLOG_INFO("translate", "ocr returned no text");
-            res->error = L"未识别到文字";
-            break;
+            // 仅整段 text（无 blocks，纯文本 AI 识别契约）仍可走 2b 整图兜底；
+            // 连 text 也无内容才是真正的「未识别到文字」
+            const auto* t = ocrRoot.find("text");
+            bool hasWholeText = t && t->type == scminijson::Value::STR
+                && t->str.find_first_not_of(" \t\r\n") != std::string::npos;
+            if (!hasWholeText) {
+                ZLOG_INFO("translate", "ocr returned no text");
+                res->error = L"未识别到文字";
+                break;
+            }
         }
         ZLOG_INFO("translate", "ocr ok (%zu line blocks, %zu plain)", lines.size(), plainTexts.size());
 
@@ -532,22 +534,7 @@ static void TranslateWorkerMain(TranslateJobInput* job) {
                 tb.y = para.y;
                 tb.w = para.w;
                 tb.h = para.h;
-                tb.lineH = para.lineHeight;
-                // 原段落版面特征（渲染层字号搜索的密度对齐目标）：
-                //   行数 = 成员行数；行宽利用率 = 成员行宽均值 / 段宽（原段行均多满）；
-                //   垂直密度 = 行数 × 中位行高 / 段高（原段纵向多满，含行距观感）
-                int pn = (int)para.lineIdx.size();
-                double sumLineW = 0;
-                for (int li : para.lineIdx) sumLineW += clusterInput[li].w;
-                tb.origLineCount = pn;
-                if (para.w > 0.5 && pn > 0) {
-                    tb.origWidthUtil = (sumLineW / pn) / para.w;
-                    if (tb.origWidthUtil > 1) tb.origWidthUtil = 1;
-                }
-                if (para.h > 0.5 && para.lineHeight > 0) {
-                    tb.origVDensity = (pn * para.lineHeight) / para.h;
-                    if (tb.origVDensity > 1) tb.origVDensity = 1;
-                }
+                tb.origLineCount = (int)para.lineIdx.size();   // 原段落行数（渲染层字号搜索用）
                 tb.text = std::move(outText);
                 translated.push_back(std::move(tb));
             }
@@ -605,10 +592,7 @@ static void TranslateWorkerMain(TranslateJobInput* job) {
             tb.box = clipped;
             tb.text = Utf8ToWideForTranslate(rb.text);
             if (tb.text.find_first_not_of(L" \t\r\n") == std::wstring::npos) continue;
-            if (rb.lineH > 0) tb.lineHeightPx = rb.lineH / ds;
             tb.origLineCount = rb.origLineCount;
-            tb.origWidthUtil = rb.origWidthUtil;
-            tb.origVDensity = rb.origVDensity;
             res->blocks.push_back(std::move(tb));
         }
         if (res->blocks.empty()) {
@@ -714,39 +698,25 @@ namespace sctranslatedraw {
 static const int PANEL_PAD = 4;
 static const int PANEL_RADIUS = 4;
 
-// 译文字号搜索区间（逻辑像素）：以原字号估计为锚点，在区间内做可行性二分 +
-// 候选评分（见 FitParagraph），锚点与端点均只作约束/兜底，不直接决定字号。
+// 译文字号搜索区间（逻辑像素）：min(能装进段框的最大字号, 原文行距对应字号)，
+// 见 FitParagraph；端点只作钳制，不直接决定字号。
 
 static const int FONT_MIN_PX = 9;
 static const int FONT_MAX_PX = 48;
 
-// ---- 原段落版面特征：字号搜索的「密度对齐」目标 ----
-// 由 OCR 行聚类随块带下（TranslateBlock.orig*，worker 侧从成员行统计）。
-// boxW/boxH 为绘制时实际框（与选区交集后），利用率类特征均相对该框。
+// 整图兜底块（无行级特征）的默认字号上限。
 
-struct ParaFeatures {
-    bool valid = false;        // 是否具备行级特征（整图兜底块 = false，用合成密度目标）
-    float boxW = 0.0f;
-    float boxH = 0.0f;
-    float fontPx = 0.0f;       // 原字号估计（中位行高 − 双内边距；软约束锚点）
-    int lineCount = 0;         // 原行数
-    float widthUtil = 0.0f;    // 原平均行宽利用率（成员行宽均值 / 段宽）
-    float vDensity = 0.0f;     // 原垂直密度（行数 × 中位行高 / 段高）
-};
+static const int FALLBACK_FONT_PX = 16;
 
 // ---- 某一候选字号下的整段真实排版测量 ----
-// 按段落宽度真实折行后统计：实际行数 / 总高 / 逐行实际宽度，并派生各项利用率
-// 与高度可行性，供候选评分与最终排版复用。
+// 按段落宽度真实折行后统计：实际行数 / 行高 / 总高与高度可行性，供字号搜索
+// 与最终排版复用。
 
 struct LayoutMeasure {
     std::vector<std::wstring> lines;      // 折行结果
-    std::vector<float> lineWidths;        // 每行实际宽（去行尾空白）
     float lineH = 0.0f;                   // 行高（font.GetHeight，含字体默认行距）
     float totalH = 0.0f;                  // 行数 × 行高
-    float widthUtil = 0.0f;               // 平均行宽 / 段宽
-    float heightUtil = 0.0f;              // 总高 / 段高
-    float lastUtil = 0.0f;                // 末行宽 / 段宽
-    bool fitsHeight = false;              // 总高 ≤ 文本区高（段高 − 双内边距）
+    bool fitsHeight = false;              // 总高 ≤ 段框高（垂直内边距由绘制侧让位）
 };
 
 // 用逐字符宽度贪心折行。字符宽按「前缀累宽差分」测量（与 GDI+ 渲染宽度同源），
@@ -805,78 +775,52 @@ static std::vector<std::wstring> WrapText(Gdiplus::Graphics& g, const Gdiplus::F
     return lines;
 }
 
-// 测单行渲染宽度（先去行尾空白，避免折行断在空格后虚增利用率）。
-// 与 WrapText 的前缀累宽同用 MeasureString + MeasureTrailingSpaces，测量同源。
-
-static float MeasureLineWidth(Gdiplus::Graphics& g, const Gdiplus::Font& font,
-                              const std::wstring& line) {
-    size_t end = line.size();
-    while (end > 0 && (line[end - 1] == L' ' || line[end - 1] == L'\t')) end--;
-    if (end == 0) return 0.0f;
-    Gdiplus::StringFormat sf;
-    sf.SetFormatFlags(Gdiplus::StringFormatFlagsMeasureTrailingSpaces);
-    Gdiplus::RectF layout(0.0f, 0.0f, 65536.0f, 65536.0f), bound;
-    g.MeasureString(line.c_str(), (INT)end, &font, layout, &sf, &bound);
-    return bound.X + bound.Width;
-}
-
-// 候选字号真实排版测量：按段宽折行 → 行高/总高/逐行宽 → 各利用率与高度可行性。
-// availW/availH 为文本区（框 − 双内边距），利用率相对整框（与原段特征同基准）。
+// 候选字号真实排版测量：按段宽折行 → 行高/总高 → 高度可行性。
+// availW 为文本区宽（框 − 双内边距）；fitH 为高度可行域 = 段框高（非
+// 「框高 − 双内边距」：OCR 框紧贴字形，单行段减去双内边距后连最小字号一行
+// 都放不下，字号会被钉死在下限；内边距成为垂直余量，由绘制侧垂直居中吸收）。
 
 static LayoutMeasure MeasureAt(Gdiplus::Graphics& g, const Gdiplus::FontFamily& ff,
                                const std::wstring& text, int fontPx,
-                               const ParaFeatures& pf, float availW, float availH) {
+                               float availW, float fitH) {
     LayoutMeasure m;
     Gdiplus::Font font(&ff, (Gdiplus::REAL)fontPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     m.lines = WrapText(g, font, text, availW);
     m.lineH = font.GetHeight(&g);
     if (m.lineH < 1.0f) m.lineH = (float)fontPx;
     m.totalH = m.lines.size() * m.lineH;
-    m.fitsHeight = m.totalH <= availH + 0.5f;
-    if (pf.boxW > 1.0f && pf.boxH > 1.0f) {
-        float sumW = 0.0f;
-        m.lineWidths.reserve(m.lines.size());
-        for (const std::wstring& line : m.lines) {
-            float w = MeasureLineWidth(g, font, line);
-            m.lineWidths.push_back(w);
-            sumW += w;
-        }
-        m.widthUtil = sumW / (float)m.lines.size() / pf.boxW;
-        if (m.widthUtil > 1.0f) m.widthUtil = 1.0f;
-        m.heightUtil = m.totalH / pf.boxH;
-        m.lastUtil = m.lineWidths.back() / pf.boxW;
-    }
+    m.fitsHeight = m.totalH <= fitH + 0.5f;
     return m;
 }
 
-// 综合视觉密度评分（越小越优）：目标不是最大字号，而是排版观感最接近原段落。
-// 各项均为相对量纲（比例差 / 相对字号差 / 比例罚项），权重经验取值：
-//   垂直密度差 1.0（最直观的纵向满/空观感）＞ 字号锚点偏离 0.75（不明显偏离
-//   原字号）＞ 行宽利用率差 0.5 ＞ 末行过短罚项 0.4（≥2 行且末行宽占比
-//   < 0.15 时，对不足部分线性罚，避免孤字/孤词收尾）。
+// 字体排版行高比（GetHeight / fontPx，微软雅黑 ≈ 1.3）：把「原文行距」换算为
+// 字号的除数（行距 ÷ 行高比 = 与该行距观感一致的字号）。运行时用探针字号实测
+// 一次，不依赖具体字体的硬编码行距。
 
-static float ScoreMeasure(const LayoutMeasure& m, int fontPx, const ParaFeatures& pf) {
-    float s = 1.00f * fabsf(m.heightUtil - pf.vDensity);
-    s += 0.50f * fabsf(m.widthUtil - pf.widthUtil);
-    float anchor = pf.fontPx > 1.0f ? pf.fontPx : 1.0f;
-    s += 0.75f * fabsf((float)fontPx - pf.fontPx) / anchor;
-    if (m.lines.size() >= 2 && m.lastUtil < 0.15f) s += 0.40f * (0.15f - m.lastUtil);
-    return s;
+static float LineHeightRatio(Gdiplus::Graphics& g, const Gdiplus::FontFamily& ff) {
+    Gdiplus::Font probe(&ff, 24.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    float h = probe.GetHeight(&g);
+    return h > 1.0f ? h / 24.0f : 1.3f;
 }
 
-// 段落字号搜索（每段独立，绝不整图统一字号）：
-//   1) 可行性硬约束 = 真实排版总高不超段落文本区高；字号对总高单调
-//      （字号越大行高越大且行数不减），故先二分出最大可行字号 maxFit；
-//   2) 候选集 = 锚点（原字号估计，若可行）∪ maxFit 及其下探 1~3 档 ∪ 锚点↔maxFit
-//      插值点；锚点不可行（译文比原文长）时补 [下限, maxFit] 中点覆盖稀疏原段；
-//   3) 逐候选真实排版测量，仅在可行字号中按 ScoreMeasure 取密度最接近者。
-// 连下限字号都装不下时退回下限（面板扩高 + 末行截断由绘制侧兜底）。
+// 段落字号搜索（每段独立，绝不整图统一字号）：字号由段落自身几何决定，不依赖
+// 「OCR 行框 → 原字号」的换算假设（行框语义随 provider 而异，紧贴字形 / 整字高
+// 框都有，乘系数估算会在整字高框上系统性高估，且同页正文行高一致导致各段字号
+// 被钉到同一个高估值——过大且统一）：
+//   1) 可行性硬约束 = 真实排版总高不超段框高（fitH，见 MeasureAt）；字号对
+//      总高单调（字号越大行高越大且行数不减），故先二分出最大可行字号 maxFit
+//      （译文比原文长时收缩到装得下为止）；
+//   2) 行距对齐上限 cap = 段框高 ÷ 原文行数 ÷ 行高比：译文的行距与原段落行距
+//      一致，短译文（折行后行数少于原文）不会被放大去撑满段框；
+//   3) 字号 = min(maxFit, cap)。段框高与行数每段不同，字号随段落区域自适应。
+// 整图兜底块（origLineCount = 0，无行级特征）用默认字号上限；连下限字号都装
+// 不下时退回下限（面板扩高 + 末行截断由绘制侧兜底）。
 // 返回最终字号，mOut 带回该字号下的完整测量供最终排版。
 
 static int FitParagraph(Gdiplus::Graphics& g, const Gdiplus::FontFamily& ff,
-                        const std::wstring& text, const ParaFeatures& pf,
-                        float availW, float availH, LayoutMeasure& mOut) {
-    LayoutMeasure atMin = MeasureAt(g, ff, text, FONT_MIN_PX, pf, availW, availH);
+                        const std::wstring& text, int origLineCount,
+                        float availW, float fitH, LayoutMeasure& mOut) {
+    LayoutMeasure atMin = MeasureAt(g, ff, text, FONT_MIN_PX, availW, fitH);
     if (!atMin.fitsHeight) {              // 下限也装不下：退回下限，溢出走兜底
         mOut = std::move(atMin);
         return FONT_MIN_PX;
@@ -886,7 +830,7 @@ static int FitParagraph(Gdiplus::Graphics& g, const Gdiplus::FontFamily& ff,
         int lo = FONT_MIN_PX, hi = FONT_MAX_PX;
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
-            if (MeasureAt(g, ff, text, mid, pf, availW, availH).fitsHeight) {
+            if (MeasureAt(g, ff, text, mid, availW, fitH).fitsHeight) {
                 maxFit = mid;
                 lo = mid + 1;
             } else {
@@ -894,48 +838,21 @@ static int FitParagraph(Gdiplus::Graphics& g, const Gdiplus::FontFamily& ff,
             }
         }
     }
-    int anchor = (int)(pf.fontPx + 0.5f);
-    if (anchor < FONT_MIN_PX) anchor = FONT_MIN_PX;
-    if (anchor > FONT_MAX_PX) anchor = FONT_MAX_PX;
-    std::vector<int> cands;
-    auto push = [&](int v) {
-        if (v < FONT_MIN_PX || v > FONT_MAX_PX) return;
-        for (int c : cands) if (c == v) return;
-        cands.push_back(v);
-    };
-    push(anchor);
-    push(maxFit);
-    push(maxFit - 1);
-    push(maxFit - 2);
-    push(maxFit - 3);
-    if (anchor < maxFit) {
-        int span = maxFit - anchor;
-        push(anchor + span / 2);
-        push(anchor + span / 4);
-        push(anchor + span * 3 / 4);
-    } else if (anchor > maxFit) {
-        push(FONT_MIN_PX + (maxFit - FONT_MIN_PX) / 2);
+    int cap = FONT_MAX_PX;
+    if (origLineCount > 0) {
+        cap = (int)(fitH / (float)origLineCount / LineHeightRatio(g, ff));
+    } else {
+        cap = FALLBACK_FONT_PX;           // 兜底块无行级特征：默认字号上限
     }
-    int best = maxFit;
-    float bestScore = 3.4e38f;
-    LayoutMeasure bestM;
-    for (int v : cands) {
-        LayoutMeasure m = MeasureAt(g, ff, text, v, pf, availW, availH);
-        if (!m.fitsHeight) continue;
-        float s = ScoreMeasure(m, v, pf);
-        if (s < bestScore) {
-            bestScore = s;
-            best = v;
-            bestM = std::move(m);
-        }
-    }
-    if (bestM.lines.empty()) bestM = MeasureAt(g, ff, text, best, pf, availW, availH);
-    mOut = std::move(bestM);
-    return best;
+    if (cap < FONT_MIN_PX) cap = FONT_MIN_PX;
+    if (cap > FONT_MAX_PX) cap = FONT_MAX_PX;
+    int fontPx = maxFit < cap ? maxFit : cap;
+    mOut = MeasureAt(g, ff, text, fontPx, availW, fitH);
+    return fontPx;
 }
 
 // 绘制单个译文覆盖面板：白底圆角面板盖住原段落区域，整段译文按搜索出的字号
-// 折行排版（密度对齐而非最大字号，见 FitParagraph）。搜索含十次级真实排版
+// 折行排版（行距对齐 + 框高可行性收缩，见 FitParagraph）。搜索含十次级真实排版
 // 测量，结果按「绘制时框宽高」缓存在块内（选区不变时每帧直接复用）；仅当
 // 连下限字号都装不下时面板才向下扩展（不超 clip）并截断末行，属兜底路径。
 // tb.box/clip 为绝对逻辑坐标，ox/oy 为绘制平移（OnPaint = -虚拟屏原点，
@@ -960,33 +877,17 @@ static void DrawBlockPanel(HDC hdc, TranslateBlock& tb, const RECT& clip, float 
     int pad = PANEL_PAD;
     int availW = boxW - pad * 2;
     if (availW < 8) availW = 8;
-    float availH = (float)boxH - pad * 2;
+    // 高度可行域 = 段框高（非框高 − 双内边距，见 MeasureAt）；
+    // 垂直内边距由绘制侧垂直居中吸收
+    float fitH = (float)boxH;
     float maxPanelBottom = (float)clipOff.bottom;
 
     // ---- 字号搜索（带缓存：键 = 绘制时框宽高，几何变化才重排）----
     if (tb.fitKeyW != boxW || tb.fitKeyH != boxH || tb.fitLines.empty()
         || tb.fitFontPx < FONT_MIN_PX) {
-        ParaFeatures pf;
-        pf.boxW = (float)boxW;
-        pf.boxH = (float)boxH;
-        pf.fontPx = tb.lineHeightPx > 1.0 ? (float)(tb.lineHeightPx - pad * 2)
-                                          : (float)(boxH - pad * 2);
-        if (pf.fontPx < (float)FONT_MIN_PX) pf.fontPx = (float)FONT_MIN_PX;
-        if (pf.fontPx > (float)FONT_MAX_PX) pf.fontPx = (float)FONT_MAX_PX;
-        if (tb.origLineCount > 0) {
-            pf.valid = true;
-            pf.lineCount = tb.origLineCount;
-            pf.widthUtil = (float)tb.origWidthUtil;
-            pf.vDensity = (float)tb.origVDensity;
-        } else {
-            // 整图兜底块无行级特征：合成「接近占满」的密度目标
-            pf.lineCount = 1;
-            pf.widthUtil = 0.95f;
-            pf.vDensity = 0.95f;
-        }
         LayoutMeasure m;
         int fontPx = FitParagraph(graphics, Gdiplus::FontFamily(SC_FONT_FACE), tb.text,
-                                  pf, (float)availW, availH, m);
+                                  tb.origLineCount, (float)availW, fitH, m);
         tb.fitKeyW = boxW;
         tb.fitKeyH = boxH;
         tb.fitFontPx = fontPx;
@@ -998,15 +899,18 @@ static void DrawBlockPanel(HDC hdc, TranslateBlock& tb, const RECT& clip, float 
     float lineH = tb.fitLineH > 0.5f ? tb.fitLineH : (float)fontPx;
     const std::vector<std::wstring>& lines = tb.fitLines;
 
-    // 面板高度：装得下时严格取原段落高（覆盖框即原段框，保持原版面占位）；
-    // 装不下（下限字号仍溢出）才向下扩展到裁剪边界
-    float neededH = lines.size() * lineH + pad * 2;
+    // 面板高度：文字总高不超过段框高（字号搜索的可行性约束）时严格取原段落高
+    // （覆盖框即原段框，保持原版面占位），文字垂直居中、垂直内边距让位；
+    // 下限字号仍溢出（可行性早退的兜底路径）才向下扩展到裁剪边界
+    float textH = lines.size() * lineH;
     float panelH = (float)boxH;
-    if (neededH > panelH) {
-        panelH = neededH;
+    if (textH > panelH) {
+        panelH = textH + pad * 2;
         if (boxI.top + panelH > maxPanelBottom) panelH = maxPanelBottom - boxI.top;
         if (panelH < (float)boxH) panelH = (float)boxH;
     }
+    float padY = (panelH - textH) / 2;
+    if (padY < 0) padY = 0;
 
     // 面板：近实心白底盖住原文字 + 浅灰描边
     Gdiplus::RectF panel((Gdiplus::REAL)boxI.left, (Gdiplus::REAL)boxI.top,
@@ -1031,9 +935,13 @@ static void DrawBlockPanel(HDC hdc, TranslateBlock& tb, const RECT& clip, float 
     sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
     sf.SetTrimming(Gdiplus::StringTrimmingNone);
 
-    int visible = (int)((panelH - pad * 2) / lineH);
-    if (visible < 1) visible = 1;
-    float y = panel.Y + pad;
+    // 默认全显（可行字号必在框内），仅兜底扩高被裁剪边界压回时按剩余高度截断
+    int visible = (int)lines.size();
+    if ((float)visible * lineH > panelH - padY * 2 + 0.5f) {
+        visible = (int)((panelH - padY * 2) / lineH);
+        if (visible < 1) visible = 1;
+    }
+    float y = panel.Y + padY;
     for (int i = 0; i < (int)lines.size() && i < visible; i++) {
         std::wstring line = lines[i];
         if (i == visible - 1 && (size_t)visible < lines.size()) {
